@@ -12,6 +12,7 @@ The "QSO-Striker" is a derivative of the "Exo-Striker", which is developed for m
 </p>
 
 
+
 **Developer**
 
 * Trifon Trifonov, MPIA Heidelberg.
