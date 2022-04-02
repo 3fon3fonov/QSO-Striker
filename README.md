@@ -2,7 +2,7 @@
 **The QSO-Striker** 
 
 <p align="center">
-  <img width="400" src="./docs/png/33_striker.png">
+  <img width="400" src="./docs/png/33_striker_qso.png">
 </p>
  
 The "QSO-Striker" is a derivative of the "Exo-Striker", which is developed for modeling the variability of quasar light-curves (QSOs). It can perform MCMC and nested sampling, Gaussian Processes modeling a.k.a. Damped Random Walk (DRW) model. The QSO-Striker offers fast fully interactive plots, and export ready-to-use LaTeX tables with best-fit parameters, errors, and statistics. It combines Fortran efficiency and Python flexibility and is cross-platform compatible (MAC OS, Linux, Windows). 
