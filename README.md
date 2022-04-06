@@ -1,5 +1,5 @@
 
-**The QSO-Striker** 
+**The QSO-Striker**: A derivative of the "Exo-Striker", which is developed for modeling the variability of quasar light-curves (QSOs).
 
 <p align="center">
   <img width="400" src="./docs/png/33_striker_qso.png">
