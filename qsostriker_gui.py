@@ -2,5 +2,5 @@
 
 import sys
 sys.argv.append('-QSO')    
-import exostriker
-exostriker.gui.main()
+import qsostriker
+qsostriker.gui.main()
