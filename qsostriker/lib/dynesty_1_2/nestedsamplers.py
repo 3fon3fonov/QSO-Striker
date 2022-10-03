@@ -26,13 +26,13 @@ Includes:
 import math
 import copy
 import numpy as np
-
 from .sampler import Sampler
 from .bounding import (UnitCube, Ellipsoid, MultiEllipsoid, RadFriends,
-                       SupFriends)
+                       SupFriends, rand_choice)
 from .sampling import (sample_unif, sample_rwalk, sample_slice, sample_rslice,
                        sample_hslice)
-from .utils import unitcheck, get_enlarge_bootstrap
+from .utils import (unitcheck, get_enlarge_bootstrap, save_sampler,
+                    restore_sampler)
 
 __all__ = [
     "UnitCubeSampler", "SingleEllipsoidSampler", "MultiEllipsoidSampler",
@@ -53,6 +53,7 @@ class SuperSampler(Sampler):
     This is a class that provides common functionality to all the
     implemented samplers
     """
+
     def __init__(self,
                  loglikelihood,
                  prior_transform,
@@ -130,11 +131,14 @@ class SuperSampler(Sampler):
         self.walks = max(2, self.kwargs.get('walks', 25))
         self.facc = self.kwargs.get('facc', 0.5)
         self.facc = min(1., max(1. / self.walks, self.facc))
+        self.rwalk_history = {'naccept': 0, 'nreject': 0}
 
         # Initialize slice parameters.
         self.slices = self.kwargs.get('slices', 5)
         self.fmove = self.kwargs.get('fmove', 0.9)
         self.max_move = self.kwargs.get('max_move', 100)
+        self.slice_history = {'ncontract': 0, 'nexpand': 0}
+        self.hslice_history = {'nmove': 0, 'nreflect': 0, 'ncontract': 0}
 
     def propose_unif(self, *args):
         pass
@@ -142,11 +146,11 @@ class SuperSampler(Sampler):
     def propose_live(self, *args):
         pass
 
-    def update_unif(self, blob):
+    def update_unif(self, blob, update=True):
         """Filler function."""
         pass
 
-    def update_rwalk(self, blob):
+    def update_rwalk(self, blob, update=True):
         """Update the random walk proposal scale based on the current
         number of accepted/rejected steps.
         For rwalk the scale is important because it
@@ -154,9 +158,16 @@ class SuperSampler(Sampler):
         I.e. if scale is too large, the proposal efficiency will be very low
         so it's likely that we'll only do one random walk step at the time,
         thus producing very correlated chain.
+        The keyword update determines if we are just accumulating the number
+        of steps or actually adjusting the scale
         """
         self.scale = blob['scale']
-        accept, reject = blob['accept'], blob['reject']
+        hist = self.rwalk_history
+        hist['naccept'] += blob['accept']
+        hist['nreject'] += blob['reject']
+        if not update:
+            return
+        accept, reject = hist['naccept'], hist['nreject']
         facc = (1. * accept) / (accept + reject)
         # Here we are now trying to solve the Eqn
         # f0 = F(s) where F is the function
@@ -171,19 +182,31 @@ class SuperSampler(Sampler):
         # See also Robbins-Munro recursion which we don't follow
         # here because our coefficients a_k do not obey \sum a_k^2 = \infty
         self.scale *= math.exp((facc - self.facc) / self.ncdim / self.facc)
+        hist['naccept'] = 0
+        hist['nreject'] = 0
 
-    def update_slice(self, blob):
+    def update_slice(self, blob, update=True):
         """Update the slice proposal scale based on the relative
         size of the slices compared to our initial guess.
         For slice sampling the scale is only 'advisory' in the sense that
         the right scale will just speed up sampling as we'll have to expand
         or contract less. It won't affect the quality of the samples much.
+        The keyword update determines if we are just accumulating the number
+        of steps or actually adjusting the scale
         """
         # see https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4063214/
         # also 2002.06212
         # https://www.tandfonline.com/doi/full/10.1080/10618600.2013.791193
         # and https://github.com/joshspeagle/dynesty/issues/260
-        nexpand, ncontract = max(blob['nexpand'], 1), blob['ncontract']
+        hist = self.slice_history
+
+        hist['nexpand'] += blob['nexpand']
+        hist['ncontract'] += blob['ncontract']
+        if blob['expansion_warning_set']:
+            self.kwargs['slice_doubling'] = True
+        if not update:
+            return
+        nexpand, ncontract = max(hist['nexpand'], 1), hist['ncontract']
         mult = (nexpand * 2. / (nexpand + ncontract))
         # avoid drastic updates to the scale factor limiting to factor
         # of two
@@ -191,22 +214,66 @@ class SuperSampler(Sampler):
         # Remember I can't apply the rule that scale < cube diagonal
         # because scale is multiplied by axes
         self.scale = self.scale * mult
+        hist['nexpand'] = 0
+        hist['ncontract'] = 0
 
-    def update_hslice(self, blob):
+    def update_hslice(self, blob, update=True):
         """Update the Hamiltonian slice proposal scale based
-        on the relative amount of time spent moving vs reflecting."""
-
-        nmove, nreflect = blob['nmove'], blob['nreflect']
-        ncontract = blob.get('ncontract', 0)
+        on the relative amount of time spent moving vs reflecting.
+        The keyword update determines if we are just accumulating the number
+        of steps or actually adjusting the scale
+        """
+        hist = self.hslice_history
+        hist['nmove'] += blob['nmove']
+        hist['nreflect'] += blob['nreflect']
+        hist['ncontract'] += blob.get('ncontract', 0)
+        if not update:
+            return
+        nmove, nreflect = hist['nmove'], hist['nreflect']
+        ncontract = hist['ncontract']
         fmove = (1. * nmove) / (nmove + nreflect + ncontract + 2)
         norm = max(self.fmove, 1. - self.fmove)
         self.scale *= math.exp((fmove - self.fmove) / norm)
+        hist['nmove'] = 0
+        hist['nreflect'] = 0
+        hist['ncontract'] = 0
 
-    def update_user(self, blob):
+    def update_user(self, blob, update=True):
         """Update the scale based on the user-defined update function."""
 
         if callable(self.custom_update):
-            self.scale = self.custom_update(blob, self.scale)
+            self.scale = self.custom_update(blob, self.scale, update=update)
+
+    def save(self, fname):
+        """
+        Save the state of the dynamic sampler in a file
+
+        Parameters
+        ----------
+        fname: string
+            Filename of the save file.
+
+        """
+        save_sampler(self, fname)
+
+    @staticmethod
+    def restore(fname, pool=None):
+        """
+        Restore the dynamic sampler from a file.
+        It is assumed that the file was created using .save() method
+        of DynamicNestedSampler or as a result of checkpointing during
+        run_nested()
+
+        Parameters
+        ----------
+        fname: string
+            Filename of the save file.
+        pool: object(optional)
+            The multiprocessing pool-like object that supports map()
+            calls that will be used in the restored object.
+
+        """
+        return restore_sampler(fname, pool=pool)
 
 
 class UnitCubeSampler(SuperSampler):
@@ -232,7 +299,7 @@ class UnitCubeSampler(SuperSampler):
         `live_logl`, the associated loglikelihoods.
 
     method : {`'unif'`, `'rwalk'`,
-              `'slice'`, `'rslice'`, `'hslice'`}, optional
+        `'slice'`, `'rslice'`, `'hslice'`}, optional
         Method used to sample uniformly within the likelihood constraint,
         conditioned on the provided bounds.
 
@@ -263,6 +330,7 @@ class UnitCubeSampler(SuperSampler):
         A dictionary of additional parameters.
 
     """
+
     def __init__(self,
                  loglikelihood,
                  prior_transform,
@@ -351,8 +419,8 @@ class SingleEllipsoidSampler(SuperSampler):
         on the unit cube, `live_v`, the transformed variables, and
         `live_logl`, the associated loglikelihoods.
 
-    method : {`'unif'`, `'rwalk'`,
-              `'slice'`, `'rslice'`, `'hslice'`}, optional
+    method : {`'unif'`, `'rwalk'`, `'slice'`, `'rslice'`,
+        `'hslice'`}, optional
         Method used to sample uniformly within the likelihood constraint,
         conditioned on the provided bounds.
 
@@ -383,6 +451,7 @@ class SingleEllipsoidSampler(SuperSampler):
         A dictionary of additional parameters.
 
     """
+
     def __init__(self,
                  loglikelihood,
                  prior_transform,
@@ -440,13 +509,21 @@ class SingleEllipsoidSampler(SuperSampler):
         """Propose a new live point by sampling *uniformly*
         within the ellipsoid."""
 
+        if self.ncdim != self.npdim and self.nonbounded is not None:
+            nonb = self.nonbounded[:self.ncdim]
+        else:
+            nonb = self.nonbounded
+        niter = 0
         while True:
             # Sample a point from the ellipsoid.
             u = self.ell.sample(rstate=self.rstate)
-
+            niter += 1
             # Check if `u` is within the unit cube.
-            if unitcheck(u, self.nonbounded):
+            if unitcheck(u, nonb):
                 break  # if it is, we're done!
+
+        # TODO We should probably produce a warning if niter is too large
+
         if self.npdim != self.ncdim:
             u = np.concatenate(
                 [u, self.rstate.uniform(0, 1, self.npdim - self.ncdim)])
@@ -496,8 +573,8 @@ class MultiEllipsoidSampler(SuperSampler):
         on the unit cube, `live_v`, the transformed variables, and
         `live_logl`, the associated loglikelihoods.
 
-    method : {`'unif'`, `'rwalk'`,
-              `'slice'`, `'rslice'`, `'hslice'`}, optional
+    method : {`'unif'`, `'rwalk'`, `'slice'`, `'rslice'`,
+        `'hslice'`}, optional
         Method used to sample uniformly within the likelihood constraint,
         conditioned on the provided bounds.
 
@@ -528,6 +605,7 @@ class MultiEllipsoidSampler(SuperSampler):
         A dictionary of additional parameters.
 
     """
+
     def __init__(self,
                  loglikelihood,
                  prior_transform,
@@ -589,14 +667,19 @@ class MultiEllipsoidSampler(SuperSampler):
             nonb = self.nonbounded[:self.ncdim]
         else:
             nonb = self.nonbounded
+
+        niter = 0
+
         while True:
             # Sample a point from the union of ellipsoids.
             # Returns the point `u`, ellipsoid index `idx`, and number of
             # overlapping ellipsoids `q` at position `u`.
             u, idx = self.mell.sample(rstate=self.rstate)
+            niter += 1
             # Check if the point is within the unit cube.
             if unitcheck(u, nonb):
                 break  # if successful, we're done!
+        # TODO I should warn if niter is too high
         if self.ncdim != self.npdim:
             u = np.concatenate(
                 [u, self.rstate.uniform(0, 1, self.npdim - self.ncdim)])
@@ -615,15 +698,9 @@ class MultiEllipsoidSampler(SuperSampler):
         u = self.live_u[i, :]
         u_fit = u[:self.ncdim]
 
-        # Check for ellipsoid overlap.
-        ell_idxs = self.mell.within(u_fit)
-        nidx = len(ell_idxs)
-
         # Automatically trigger an update if we're not in any ellipsoid.
-        if nidx == 0:
-
+        if not self.mell.contains(u_fit):
             # Update the bounding ellipsoids.
-
             bound = self.update()
             if self.save_bounds:
                 self.bound.append(bound)
@@ -631,19 +708,23 @@ class MultiEllipsoidSampler(SuperSampler):
             self.since_update = 0
 
             # Check for ellipsoid overlap (again).
-            ell_idxs = self.mell.within(u_fit)
-            nidx = len(ell_idxs)
-            if nidx == 0:
+            if not self.mell.contains(u_fit):
                 raise RuntimeError('Update of the ellipsoid failed')
 
-        # Pick a random ellipsoid that encompasses `u`.
-        ell_idx = ell_idxs[self.rstate.integers(nidx)]
-
-        # Choose axes.
-        if self.sampling in ['rwalk', 'rslice']:
-            ax = self.mell.ells[ell_idx].axes
-        elif self.sampling == 'slice':
-            ax = self.mell.ells[ell_idx].paxes
+        if self.sampling in ['rwalk', 'rslice', 'slice']:
+            # Pick a random ellipsoid (not necessarily the one that contains u)
+            # This a crucial step as we must choose a random ellipsoid,
+            # rather than the ellipsoid to which this point belongs.
+            # because a non-random ellipsoid can break detailed balance
+            # see #364
+            # here we choose ellipsoid in proportion of its volume
+            probs = np.exp(self.mell.logvols - self.mell.logvol_tot)
+            ell_idx = rand_choice(probs, self.rstate)
+            # Choose axes.
+            if self.sampling == 'slice':
+                ax = self.mell.ells[ell_idx].paxes
+            else:
+                ax = self.mell.ells[ell_idx].axes
         else:
             ax = np.identity(self.npdim)
 
@@ -673,8 +754,8 @@ class RadFriendsSampler(SuperSampler):
         on the unit cube, `live_v`, the transformed variables, and
         `live_logl`, the associated loglikelihoods.
 
-    method : {`'unif'`, `'rwalk'`,
-              `'slice'`, `'rslice'`, `'hslice'`}, optional
+    method : {`'unif'`, `'rwalk'`, `'slice'`, `'rslice'`,
+        `'hslice'`}, optional
         Method used to sample uniformly within the likelihood constraint,
         conditioned on the provided bounds.
 
@@ -705,6 +786,7 @@ class RadFriendsSampler(SuperSampler):
         A dictionary of additional parameters.
 
     """
+
     def __init__(self,
                  loglikelihood,
                  prior_transform,
@@ -823,7 +905,7 @@ class SupFriendsSampler(SuperSampler):
         `live_logl`, the associated loglikelihoods.
 
     method : {`'unif'`, `'rwalk'`,
-              `'slice'`, `'rslice'`, `'hslice'`}, optional
+        `'slice'`, `'rslice'`, `'hslice'`}, optional
         Method used to sample uniformly within the likelihood constraint,
         conditioned on the provided bounds.
 
@@ -854,6 +936,7 @@ class SupFriendsSampler(SuperSampler):
         A dictionary of additional parameters.
 
     """
+
     def __init__(self,
                  loglikelihood,
                  prior_transform,

@@ -9,23 +9,30 @@ import sys
 import warnings
 import math
 import copy
+import time
+import os
 from collections import namedtuple
 from functools import partial
 import numpy as np
 from scipy.special import logsumexp
-
+import pickle as pickle_module
+# To allow replacing of the pickler
 try:
     import tqdm
 except ImportError:
     tqdm = None
 
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
 from .results import Results, print_fn, results_substitute
 
 __all__ = [
     "unitcheck", "resample_equal", "mean_and_cov", "quantile", "jitter_run",
-    "resample_run", "simulate_run", "reweight_run", "unravel_run",
-    "merge_runs", "kld_error", "_merge_two", "_get_nsamps_samples_n",
-    "get_enlarge_bootstrap"
+    "resample_run", "reweight_run", "unravel_run", "merge_runs", "kld_error",
+    "_merge_two", "_get_nsamps_samples_n", "get_enlarge_bootstrap"
 ]
 
 SQRTEPS = math.sqrt(float(np.finfo(np.float64).eps))
@@ -36,7 +43,7 @@ IteratorResult = namedtuple('IteratorResult', [
     'delta_logz'
 ])
 
-IteratorResultShort = namedtuple('IteratorResult', [
+IteratorResultShort = namedtuple('IteratorResultShort', [
     'worst', 'ustar', 'vstar', 'loglstar', 'nc', 'worst_it', 'boundidx',
     'bounditer', 'eff'
 ])
@@ -46,6 +53,7 @@ class LogLikelihood:
     """ Class that calls the likelihood function (using a pool if provided)
     Also if requested it saves the history of evaluations
     """
+
     def __init__(self,
                  loglikelihood,
                  ndim,
@@ -110,7 +118,9 @@ class LogLikelihood:
 
     def history_init(self):
         """ Initialize the hdf5 storage of evaluations """
-        import h5py
+        if h5py is None:
+            raise RuntimeError(
+                'h5py module is required for saving history of calls')
         self.history_counter = 0
         try:
             with h5py.File(self.history_filename, mode='w') as fp:
@@ -130,7 +140,6 @@ class LogLikelihood:
             # if failed to save before, do not try again
             # also quickly return if saving is not needed
             return
-        import h5py
         try:
             with h5py.File(self.history_filename, mode='a') as fp:
                 # pylint: disable=no-member
@@ -150,7 +159,8 @@ class LogLikelihood:
     def __getstate__(self):
         """Get state information for pickling."""
         state = self.__dict__.copy()
-        del state['pool']
+        if 'pool' in state:
+            del state['pool']
         return state
 
 
@@ -160,6 +170,7 @@ class RunRecord:
     run so it is basically a collection of various lists of
     quantities
     """
+
     def __init__(self, dynamic=False):
         """
         If dynamic is true. We initialize the class for
@@ -204,6 +215,38 @@ class RunRecord:
             self.D[k].append(newD[k])
 
 
+class DelayTimer:
+    """ Utility class that allows us to detect a certain
+    time has passed"""
+
+    def __init__(self, dt):
+        """ Initialise the time with delay of dt seconds
+
+        Parameters
+        ----------
+
+        dt: float
+            The number of seconds in the timer
+        """
+        self.dt = dt
+        self.last_time = time.time()
+
+    def is_time(self):
+        """
+        Returns true if more than self.dt seconds has passed
+        since the initialization or last call of successful is_time()
+        
+        Returns
+        -------
+        bool
+        """
+        curt = time.time()
+        if curt - self.last_time > self.dt:
+            self.last_time = curt
+            return True
+        return False
+
+
 def get_enlarge_bootstrap(sample, enlarge, bootstrap):
     """
     Determine the enlarge, bootstrap for a given run
@@ -212,34 +255,30 @@ def get_enlarge_bootstrap(sample, enlarge, bootstrap):
     DEFAULT_ENLARGE = 1.25
     DEFAULT_UNIF_BOOTSTRAP = 5
     if enlarge is not None and bootstrap is None:
-        """If enlarge is specified and bootstrap is not we just use enlarge
-        with no nootstrapping"""
+        # If enlarge is specified and bootstrap is not we just use enlarge
+        # with no nootstrapping
         assert enlarge >= 1
         return enlarge, 0
     elif enlarge is None and bootstrap is not None:
-        """
-        If bootstrap is specified but enlarge is not we just use bootstrap
-        And if we allow zero bootstrap if we want to force no bootstrap
-        """
+        # If bootstrap is specified but enlarge is not we just use bootstrap
+        # And if we allow zero bootstrap if we want to force no bootstrap
         assert ((bootstrap > 1) or (bootstrap == 0))
         return 1, bootstrap
     elif enlarge is None and bootstrap is None:
-        """
-        If neither enlarge or bootstrap are specified we are doing
-        things in auto-mode. I.e. use enlarge unless the uniform
-        sampler is selected
-        """
+        # If neither enlarge or bootstrap are specified we are doing
+        # things in auto-mode. I.e. use enlarge unless the uniform
+        # sampler is selected
         if sample == 'unif':
             return 1, DEFAULT_UNIF_BOOTSTRAP
         else:
             return DEFAULT_ENLARGE, 0
     else:
-        """Both enlarge and bootstrap were specified"""
+        # Both enlarge and bootstrap were specified
         if bootstrap == 0 or enlarge == 1:
             return enlarge, bootstrap
         else:
-            raise ValueError('Enlarge and bootstrap together do not make'
-                             'sense unless bootstrap=1 or enlarge = 1')
+            raise ValueError('Enlarge and bootstrap together do not make '
+                             'sense unless bootstrap=0 or enlarge = 1')
 
 
 def get_nonbounded(ndim, periodic, reflective):
@@ -255,11 +294,19 @@ def get_nonbounded(ndim, periodic, reflective):
     if periodic is not None or reflective is not None:
         nonbounded = np.ones(ndim, dtype=bool)
         if periodic is not None:
+            if np.max(periodic) > ndim:
+                raise ValueError(
+                    'Incorrect periodic variable index (larger than ndim')
             nonbounded[periodic] = False
         if reflective is not None:
+            if np.max(reflective) > ndim:
+                raise ValueError(
+                    'Incorrect periodic variable index (larger than ndim')
             nonbounded[reflective] = False
     else:
         nonbounded = None
+
+    return nonbounded
 
 
 def get_print_func(print_func, print_progress):
@@ -290,6 +337,30 @@ def get_seed_sequence(rstate, nitems):
     return seeds
 
 
+def get_neff_from_logwt(logwt):
+    """
+    Compute the number of effective samples from an array of unnormalized
+    log-weights. We use Kish Effective Sample Size (ESS)  formula.
+
+    Parameters
+    ----------
+    logwt: numpy array
+        Array of unnormalized weights
+
+    Returns
+    -------
+    int
+        The effective number of samples
+    """
+
+    # If weights are normalized to the sum of 1,
+    # the estimate is  N = 1/\sum(w_i^2)
+    # if the weights are not normalized
+    # N = (\sum w_i)^2 / \sum(w_i^2)
+    W = np.exp(logwt - logwt.max())
+    return W.sum()**2 / (W**2).sum()
+
+
 def unitcheck(u, nonbounded=None):
     """Check whether `u` is inside the unit cube. Given a masked array
     `nonbounded`, also allows periodic boundaries conditions to exceed
@@ -297,7 +368,7 @@ def unitcheck(u, nonbounded=None):
 
     if nonbounded is None:
         # No periodic boundary conditions provided.
-        return np.min(u) > 0 and np.max(u) < 1
+        return u.min() > 0 and u.max() < 1
     else:
         # Alternating periodic and non-periodic boundary conditions.
         unb = u[nonbounded]
@@ -574,8 +645,7 @@ def jitter_run(res, rstate=None, approx=False):
     """
     Probes **statistical uncertainties** on a nested sampling run by
     explicitly generating a *realization* of the prior volume associated
-    with each sample (dead point). Companion function to :meth:`resample_run`
-    and :meth:`simulate_run`.
+    with each sample (dead point). Companion function to :meth:`resample_run`.
 
     Parameters
     ----------
@@ -693,7 +763,6 @@ def compute_integrals(logl=None, logvol=None, reweight=None):
     # = LV_{i+1} - (LV_{i+1} -LV_i) + log(1-exp(LV_{i+1}-LV{i}))
     dlogvol = np.diff(logvol, prepend=0)
     logdvol = logvol - dlogvol + np.log1p(-np.exp(dlogvol))
-
     # logdvol is log(delta(volumes)) i.e. log (X_i-X_{i-1})
     logdvol2 = logdvol + math.log(0.5)
     # These are log(1/2(X_(i+1)-X_i))
@@ -762,7 +831,7 @@ def resample_run(res, rstate=None, return_idx=False):
     splits a nested sampling run with `K` particles (live points) into a
     series of `K` "strands" (i.e. runs with a single live point) which are then
     bootstrapped to construct a new "resampled" run. Companion function to
-    :meth:`jitter_run` and :meth:`simulate_run`.
+    :meth:`jitter_run`.
 
     Parameters
     ----------
@@ -921,52 +990,6 @@ def resample_run(res, rstate=None, return_idx=False):
         return new_res
 
 
-def simulate_run(res, rstate=None, return_idx=False, approx=False):
-    """
-    Probes **combined uncertainties** (statistical and sampling) on a nested
-    sampling run by wrapping :meth:`jitter_run` and :meth:`resample_run`.
-
-    Parameters
-    ----------
-    res : :class:`~dynesty.results.Results` instance
-        The :class:`~dynesty.results.Results` instance taken from a previous
-        nested sampling run.
-
-    rstate : `~numpy.random.Generator`, optional
-        `~numpy.random.Generator` instance.
-
-    return_idx : bool, optional
-        Whether to return the list of resampled indices used to construct
-        the new run. Default is `False`.
-
-    approx : bool, optional
-        Whether to approximate all sets of uniform order statistics by their
-        associated marginals (from the Beta distribution). Default is `False`.
-
-    Returns
-    -------
-    new_res : :class:`~dynesty.results.Results` instance
-        A new :class:`~dynesty.results.Results` instance with corresponding
-        samples and weights based on our "simulated" samples and
-        prior volumes.
-
-    """
-
-    if rstate is None:
-        rstate = get_random_generator()
-
-    # Resample run.
-    new_res, samp_idx = resample_run(res, rstate=rstate, return_idx=True)
-
-    # Jitter run.
-    new_res = jitter_run(new_res, rstate=rstate, approx=approx)
-
-    if return_idx:
-        return new_res, samp_idx
-    else:
-        return new_res
-
-
 def reweight_run(res, logp_new, logp_old=None):
     """
     Reweight a given run based on a new target distribution.
@@ -1015,7 +1038,7 @@ def reweight_run(res, logp_new, logp_old=None):
     return new_res
 
 
-def unravel_run(res, save_proposals=True, print_progress=True):
+def unravel_run(res, print_progress=True):
     """
     Unravels a run with `K` live points into `K` "strands" (a nested sampling
     run with only 1 live point). **WARNING: the anciliary quantities provided
@@ -1027,10 +1050,6 @@ def unravel_run(res, save_proposals=True, print_progress=True):
     res : :class:`~dynesty.results.Results` instance
         The :class:`~dynesty.results.Results` instance taken from a previous
         nested sampling run.
-
-    save_proposals : bool, optional
-        Whether to save a reference to the proposal distributions from the
-        original run in each unraveled strand. Default is `True`.
 
     print_progress : bool, optional
         Whether to output the current progress to `~sys.stderr`.
@@ -1102,16 +1121,6 @@ def unravel_run(res, save_proposals=True, print_progress=True):
                      logz=saved_logz,
                      logzerr=np.sqrt(saved_logzvar),
                      information=saved_h)
-
-        # Add proposal information (if available).
-        if save_proposals:
-            try:
-                rdict['prop'] = res.prop
-                rdict['prop_iter'] = res.prop_iter[strand]
-                rdict['samples_prop'] = res.samples_prop[strand]
-                rdict['scale'] = res.scale[strand]
-            except AttributeError:
-                pass
 
         # Add on batch information (if available).
         try:
@@ -1251,7 +1260,7 @@ def check_result_static(res):
 
 
 def kld_error(res,
-              error='simulate',
+              error='jitter',
               rstate=None,
               return_new=False,
               approx=False):
@@ -1267,10 +1276,9 @@ def kld_error(res,
         :class:`~dynesty.results.Results` instance for the distribution we
         are computing the KL divergence *from*.
 
-    error : {`'jitter'`, `'resample'`, `'simulate'`}, optional
-        The error method employed, corresponding to :meth:`jitter_run`,
-        :meth:`resample_run`, and :meth:`simulate_run`, respectively.
-        Default is `'simulate'`.
+    error : {`'jitter'`, `'resample'`}, optional
+        The error method employed, corresponding to :meth:`jitter_run` or
+        :meth:`resample_run`. Default is `'jitter'`.
 
     rstate : `~numpy.random.Generator`, optional
         `~numpy.random.Generator` instance.
@@ -1303,10 +1311,6 @@ def kld_error(res,
         new_res = jitter_run(res, rstate=rstate, approx=approx)
     elif error == 'resample':
         new_res, samp_idx = resample_run(res, rstate=rstate, return_idx=True)
-        logp2 = logp2[samp_idx]  # re-order our original results to match
-    elif error == 'simulate':
-        new_res, samp_idx = resample_run(res, rstate=rstate, return_idx=True)
-        new_res = jitter_run(new_res)
         logp2 = logp2[samp_idx]  # re-order our original results to match
     else:
         raise ValueError(
@@ -1561,7 +1565,7 @@ def old_stopping_function(results,
                           M=None,
                           return_vals=False):
     """
-    The default stopping function utilized by :class:`DynamicSampler`.
+    The old stopping function utilized by :class:`DynamicSampler`.
     Zipped parameters are passed to the function via :data:`args`.
     Assigns the run a stopping value based on a weighted average of the
     stopping values for the posterior and evidence::
@@ -1575,9 +1579,7 @@ def old_stopping_function(results,
         stop_post = (kld_std / kld_mean) / post_thresh
     Estimates of the mean and standard deviation are computed using `n_mc`
     realizations of the input using a provided `'error'` keyword (either
-    `'jitter'` or `'simulate'`, which call related functions :meth:`jitter_run`
-    and :meth:`simulate_run` in :mod:`dynesty.utils`, respectively, or
-    `'sim_approx'`
+    `'jitter'` or `'resample'`).
     Returns the boolean `stop <= 1`. If `True`, the :class:`DynamicSampler`
     will stop adding new samples to our results.
     Parameters
@@ -1587,7 +1589,7 @@ def old_stopping_function(results,
     args : dictionary of keyword arguments, optional
         Arguments used to set the stopping values. Default values are
         `pfrac = 1.0`, `evid_thresh = 0.1`, `post_thresh = 0.02`,
-        `n_mc = 128`, `error = 'sim_approx'`, and `approx = True`.
+        `n_mc = 128`, `error = 'jitter'`, and `approx = True`.
     rstate : `~numpy.random.Generator`, optional
         `~numpy.random.Generator` instance.
     M : `map` function, optional
@@ -1614,7 +1616,7 @@ def old_stopping_function(results,
             "be removed in future releases", DeprecationWarning)
     # Initialize values.
     if args is None:
-        args = dict({})
+        args = {}
     if M is None:
         M = map
 
@@ -1640,12 +1642,10 @@ def old_stopping_function(results,
     if n_mc < 20:
         warnings.warn("Using a small number of realizations might result in "
                       "excessively noisy stopping value estimates.")
-    error = args.get('error', 'sim_approx')
-    if error not in {'jitter', 'simulate', 'sim_approx'}:
+    error = args.get('error', 'jitter')
+    if error not in {'jitter', 'resample'}:
         raise ValueError(
             "The chosen `'error'` option {0} is not valid.".format(error))
-    if error == 'sim_approx':
-        error = 'jitter'
     approx = args.get('approx', True)
 
     # Compute realizations of ln(evidence) and the KL divergence.
@@ -1673,3 +1673,82 @@ def old_stopping_function(results,
         return stop <= 1., (stop_post, stop_evid, stop)
     else:
         return stop <= 1.
+
+
+def restore_sampler(fname, pool=None):
+    """
+    Restore the dynamic sampler from a file.
+    It is assumed that the file was created using .save() method
+    of DynamicNestedSampler or as a result of checkpointing during
+    run_nested()
+
+    Parameters
+    ----------
+    fname: string
+        Filename of the save file.
+    pool: object(optional)
+        The multiprocessing pool-like object that supports map()
+        calls that will be used in the restored object.
+
+    Returns
+    -------
+    Static or dynamic nested sampling object
+
+    """
+    from ._version import __version__ as DYNESTY_VERSION
+    with open(fname, 'rb') as fp:
+        res = pickle_module.load(fp)
+    sampler = res['sampler']
+    save_ver = res['version']
+    dynesty_format_version = 1
+    file_format_version = res['format_version']
+    if file_format_version != dynesty_format_version:
+        raise RuntimeError('Incorrect format version')
+    if save_ver != DYNESTY_VERSION:
+        warnings.warn(
+            f'The dynesty version in the checkpoint file ({save_ver})'
+            f'does not match the current dynesty version'
+            '({DYNESTY_VERSION}). That is *NOT* guaranteed to work')
+    if pool is not None:
+        sampler.M = pool.map
+        sampler.pool = pool
+        sampler.loglikelihood.pool = pool
+    else:
+        sampler.loglikelihood.pool = None
+        sampler.pool = None
+        sampler.M = map
+    return sampler
+
+
+def save_sampler(sampler, fname):
+    """
+    Save the state of the dynamic sampler in a file
+
+    Parameters
+    ----------
+    sampler: object
+        Dynamic or Static nested sampler
+    fname: string
+        Filename of the save file.
+
+    """
+    from ._version import __version__ as DYNESTY_VERSION
+    format_version = 1
+    # this is an internal version of the format we are
+    # using. Increase this if incompatible changes are being made
+    D = {
+        'sampler': sampler,
+        'version': DYNESTY_VERSION,
+        'format_version': format_version
+    }
+    tmp_fname = fname + '.tmp'
+    try:
+        with open(tmp_fname, 'wb') as fp:
+            pickle_module.dump(D, fp)
+        os.rename(tmp_fname, fname)
+    except:  # noqa
+        try:
+            os.unlink(tmp_fname)
+        except:  # noqa
+            pass
+        raise

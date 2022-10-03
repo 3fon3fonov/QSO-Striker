@@ -22,7 +22,6 @@ useful helper functions. Bounding objects include:
 """
 
 import warnings
-import math
 import numpy as np
 from numpy import linalg
 from numpy import cov as mle_cov
@@ -30,6 +29,7 @@ from scipy import spatial
 from scipy import cluster
 from scipy import linalg as lalg
 from scipy.special import logsumexp, gammaln
+from scipy.cluster.vq import kmeans2
 from .utils import unitcheck, get_seed_sequence, get_random_generator
 
 __all__ = [
@@ -39,10 +39,6 @@ __all__ = [
     "_ellipsoid_bootstrap_expand", "_friends_bootstrap_radius",
     "_friends_leaveoneout_radius"
 ]
-
-SQRTEPS = math.sqrt(float(np.finfo(np.float64).eps))
-
-from scipy.cluster.vq import kmeans2
 
 
 class UnitCube:
@@ -55,6 +51,7 @@ class UnitCube:
         The number of dimensions of the unit cube.
 
     """
+
     def __init__(self, ndim):
         self.n = ndim  # dimension
         self.vol = 1.  # volume
@@ -64,11 +61,6 @@ class UnitCube:
         """Checks if unit cube contains the point `x`."""
 
         return unitcheck(x)
-
-    def randoffset(self, rstate=None):
-        """Draw a random offset from the center of the unit cube."""
-
-        return self.sample(rstate=rstate) - 0.5
 
     def sample(self, rstate=None):
         """
@@ -94,13 +86,10 @@ class UnitCube:
 
         """
 
-        xs = np.array([self.sample(rstate=rstate) for i in range(nsamples)])
-
-        return xs
+        return rstate.uniform(size=(nsamples, self.n))
 
     def update(self, points, rstate=None, bootstrap=0, pool=None):
         """Filler function."""
-
         pass
 
 
@@ -122,6 +111,7 @@ class Ellipsoid:
         Covariance matrix describing the axes.
 
     """
+
     def __init__(self, ctr, cov, am=None, axes=None):
         self.n = len(ctr)  # dimension
         self.ctr = np.asarray(ctr)  # center coordinates
@@ -226,11 +216,6 @@ class Ellipsoid:
 
         return self.distance(x) <= 1.0
 
-    def randoffset(self, rstate=None):
-        """Return a random offset from the center of the ellipsoid."""
-
-        return np.dot(self.axes, randsphere(self.n, rstate=rstate))
-
     def sample(self, rstate=None):
         """
         Draw a sample uniformly distributed within the ellipsoid.
@@ -242,7 +227,7 @@ class Ellipsoid:
 
         """
 
-        return self.ctr + self.randoffset(rstate=rstate)
+        return self.ctr + np.dot(self.axes, randsphere(self.n, rstate=rstate))
 
     def samples(self, nsamples, rstate=None):
         """
@@ -361,6 +346,7 @@ class MultiEllipsoid:
         initialize :class:`MultiEllipsoid` if :data:`ctrs` also provided.
 
     """
+
     def __init__(self, ells=None, ctrs=None, covs=None):
         if ells is not None:
             # Try to initialize quantities using provided `Ellipsoid` objects.
@@ -490,7 +476,8 @@ class MultiEllipsoid:
             else:
                 # If `q` is not being returned, assume the user wants this
                 # done internally so we repeat the loop if needed
-                if q == 1 or rstate.uniform() < (1. / q):
+                # random is faster than uniform
+                if q == 1 or rstate.random() < (1. / q):
                     return x, idx
 
     def samples(self, nsamples, rstate=None):
@@ -637,6 +624,7 @@ class RadFriends:
         Covariance structure (correlation and size) of each ball.
 
     """
+
     def __init__(self, ndim, cov=None):
         self.n = ndim
 
@@ -701,43 +689,25 @@ class RadFriends:
 
         nctrs = len(ctrs)  # number of balls
 
-        # If there is only one ball, sample from it.
-        if nctrs == 1:
+        while True:
             ds = randsphere(self.n, rstate=rstate)
             dx = np.dot(ds, self.axes)
-            x = ctrs[0] + dx
-            if return_q:
-                return x, 1
+
+            # If there is only one ball, sample from it.
+            if nctrs == 1:
+                q = 1
+                x = ctrs[0] + dx
             else:
-                return x
-
-        # Select a ball at random.
-        idx = rstate.integers(nctrs)
-
-        # Select a point from the chosen ball.
-        ds = randsphere(self.n, rstate=rstate)
-        dx = np.dot(ds, self.axes)
-        x = ctrs[idx] + dx
-
-        # Check how many balls the point lies within, passing over
-        # the `idx`-th ball `x` was sampled from.
-        q = self.overlap(x, ctrs)
-
-        if return_q:
-            # If `q` is being returned, assume the user wants to
-            # explicitly apply the `1. / q` acceptance criterion to
-            # properly sample from the union of balls.
-            return x, q
-        else:
-            # If `q` is not being returned, assume the user wants this
-            # done internally.
-            while rstate.uniform() > (1. / q):
+                # Select a ball at random.
                 idx = rstate.integers(nctrs)
-                ds = randsphere(self.n, rstate=rstate)
-                dx = np.dot(ds, self.axes)
                 x = ctrs[idx] + dx
                 q = self.overlap(x, ctrs)
-            return x
+            # random is faster than uniform
+            if q == 1 or return_q or rstate.random() < (1. / q):
+                if return_q:
+                    return x, q
+                else:
+                    return x
 
     def samples(self, nsamples, ctrs, rstate=None):
         """
@@ -919,6 +889,7 @@ class SupFriends:
         Covariance structure (correlation and size) of each cube.
 
     """
+
     def __init__(self, ndim, cov=None):
         self.n = ndim
 
@@ -984,43 +955,26 @@ class SupFriends:
 
         nctrs = len(ctrs)  # number of cubes
 
-        # If there is only one cube, sample from it.
-        if nctrs == 1:
-            ds = (2. * rstate.uniform(size=self.n) - 1.)
+        while True:
+            ds = rstate.uniform(-1, 1, size=self.n)
             dx = np.dot(ds, self.axes)
-            x = ctrs[0] + dx
-            if return_q:
-                return x, 1
+            # If there is only one cube, sample from it.
+            if nctrs == 1:
+                x = ctrs[0] + dx
+                q = 1
             else:
-                return x
-
-        # Select a cube at random.
-        idx = rstate.integers(nctrs)
-
-        # Select a point from the chosen cube.
-        ds = (2. * rstate.uniform(size=self.n) - 1.)
-        dx = np.dot(ds, self.axes)
-        x = ctrs[idx] + dx
-
-        # Check how many cubes the point lies within, passing over
-        # the `idx`-th cube `x` was sampled from.
-        q = self.overlap(x, ctrs)
-
-        if return_q:
-            # If `q` is being returned, assume the user wants to
-            # explicitly apply the `1. / q` acceptance criterion to
-            # properly sample from the union of balls.
-            return x, q
-        else:
-            # If `q` is not being returned, assume the user wants this
-            # done internally.
-            while rstate.uniform() > (1. / q):
+                # Select a cube at random.
                 idx = rstate.integers(nctrs)
-                ds = (2. * rstate.uniform(size=self.n) - 1.)
-                dx = np.dot(ds, self.axes)
                 x = ctrs[idx] + dx
+                # Check how many cubes the point lies within, passing over
+                # the `idx`-th cube `x` was sampled from.
                 q = self.overlap(x, ctrs)
-            return x
+            # random() is faster than uniform()
+            if q == 1 or return_q or rstate.random() < (1. / q):
+                if return_q:
+                    return x, q
+                else:
+                    return x
 
     def samples(self, nsamples, ctrs, rstate=None):
         """
@@ -1142,6 +1096,7 @@ class SupFriends:
         self.axes_inv /= hsmax
 
         detsign, detln = linalg.slogdet(self.am)
+        assert detsign > 0
         self.logvol_cube = (self.n * np.log(2.) - 0.5 * detln)
         self.expand = 1.
 
@@ -1213,7 +1168,11 @@ def randsphere(n, rstate=None):
     """Draw a point uniformly within an `n`-dimensional unit sphere."""
 
     z = rstate.standard_normal(size=n)  # initial n-dim vector
-    xhat = z * (rstate.uniform()**(1. / n) / lalg.norm(z))  # scale
+    # notice I use random () instead of uniform
+    # and standard_norm instead of normal as those are faster
+    # as this is a time-critical function
+    xhat = z * (rstate.random()**(1. / n) / lalg.norm(z, check_finite=False)
+                )  # scale
     return xhat
 
 
@@ -1223,7 +1182,8 @@ def rand_choice(pb, rstate):
     The pb must sum to 1
     """
     p1 = np.cumsum(pb)
-    xr = rstate.uniform()
+    # random is faster than uniform
+    xr = rstate.random()
     return min(np.searchsorted(p1, xr), len(pb) - 1)
 
 
@@ -1507,7 +1467,7 @@ def _bootstrap_points(points, rseed):
     Tuple with selected, and not-selected points
     """
     rstate = get_random_generator(rseed)
-    npoints, ndim = points.shape
+    npoints = points.shape[0]
 
     # Resampling.
     idxs = rstate.integers(npoints, size=npoints)
@@ -1576,12 +1536,12 @@ def _friends_bootstrap_radius(args):
         # Compute distances from our "missing" points its closest neighbor
         # among the resampled points using the Euclidean norm
         # (i.e. "radius" of n-sphere).
-        dists, ids = kdtree.query(points_out, k=1, eps=0, p=2)
+        dists = kdtree.query(points_out, k=1, eps=0, p=2)[0]
     elif ftype == 'cubes':
         # Compute distances from our "missing" points its closest neighbor
         # among the resampled points using the Euclidean norm
         # (i.e. "half-side-length" of n-cube).
-        dists, ids = kdtree.query(points_out, k=1, eps=0, p=np.inf)
+        dists = kdtree.query(points_out, k=1, eps=0, p=np.inf)[0]
 
     # Conservative upper-bound on radius.
     dist = max(dists)
@@ -1600,10 +1560,10 @@ def _friends_leaveoneout_radius(points, ftype):
 
     if ftype == 'balls':
         # Compute radius to two nearest neighbors (self + neighbor).
-        dists, ids = kdtree.query(points, k=2, eps=0, p=2)
+        dists = kdtree.query(points, k=2, eps=0, p=2)[0]
     elif ftype == 'cubes':
         # Compute half-side-length to two nearest neighbors (self + neighbor).
-        dists, ids = kdtree.query(points, k=2, eps=0, p=np.inf)
+        dists = kdtree.query(points, k=2, eps=0, p=np.inf)[0]
 
     dist = dists[:, 1]  # distances to LOO nearest neighbor
 

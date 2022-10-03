@@ -9,8 +9,12 @@ import sys
 import copy
 import numpy as np
 import shutil
+from collections import namedtuple
 
 __all__ = ["Results", "print_fn"]
+
+PrintFnArgs = namedtuple('PrintFnArgs',
+                         ['niter', 'short_str', 'mid_str', 'long_str'])
 
 
 def print_fn(results,
@@ -158,7 +162,10 @@ def get_print_fn_args(results,
         long_str.append("stop: {:6.3f}".format(stop_val))
         mid_str.append("stop: {:6.3f}".format(stop_val))
 
-    return niter, short_str, mid_str, long_str
+    return PrintFnArgs(niter=niter,
+                       short_str=short_str,
+                       mid_str=mid_str,
+                       long_str=long_str)
 
 
 def print_fn_tqdm(pbar,
@@ -171,19 +178,18 @@ def print_fn_tqdm(pbar,
                   nbatch=None,
                   logl_min=-np.inf,
                   logl_max=np.inf):
-    niter, short_str, mid_str, long_str = get_print_fn_args(
-        results,
-        niter,
-        ncall,
-        add_live_it=add_live_it,
-        dlogz=dlogz,
-        stop_val=stop_val,
-        nbatch=nbatch,
-        logl_min=logl_min,
-        logl_max=logl_max)
+    fn_args = get_print_fn_args(results,
+                                niter,
+                                ncall,
+                                add_live_it=add_live_it,
+                                dlogz=dlogz,
+                                stop_val=stop_val,
+                                nbatch=nbatch,
+                                logl_min=logl_min,
+                                logl_max=logl_max)
 
-    pbar.set_postfix_str(" | ".join(long_str), refresh=False)
-    pbar.update(niter - pbar.n)
+    pbar.set_postfix_str(" | ".join(fn_args.long_str), refresh=False)
+    pbar.update(fn_args.niter - pbar.n)
 
 
 def print_fn_fallback(results,
@@ -195,16 +201,17 @@ def print_fn_fallback(results,
                       nbatch=None,
                       logl_min=-np.inf,
                       logl_max=np.inf):
-    niter, short_str, mid_str, long_str = get_print_fn_args(
-        results,
-        niter,
-        ncall,
-        add_live_it=add_live_it,
-        dlogz=dlogz,
-        stop_val=stop_val,
-        nbatch=nbatch,
-        logl_min=logl_min,
-        logl_max=logl_max)
+    fn_args = get_print_fn_args(results,
+                                niter,
+                                ncall,
+                                add_live_it=add_live_it,
+                                dlogz=dlogz,
+                                stop_val=stop_val,
+                                nbatch=nbatch,
+                                logl_min=logl_min,
+                                logl_max=logl_max)
+    niter, short_str, mid_str, long_str = (fn_args.niter, fn_args.short_str,
+                                           fn_args.mid_str, fn_args.long_str)
 
     long_str = ["iter: {:d}".format(niter)] + long_str
 
@@ -266,20 +273,54 @@ _RESULTS_STRUCTURE = [
     ('batch_bounds', 'array[XXX]',
      "The log-likelihood bounds used to run a batch.", 'nbatch???'),
     ('batch_nlive', 'array[int]',
-     """The number of live points added in a given batch ???  How is it different from samples_n""",
-     'nbatch???'),
+     "The number of live points added in a given batch ???"
+     "How is it different from samples_n", 'nbatch???'),
     ('scale', 'array[float]', "Scalar scale applied for proposals", 'niter')
 ]
 
+class Results(dict):
+    """Contains the full output of a run along with a set of helper
+    functions for summarizing the output."""
 
-class Results:
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+    def __repr__(self):
+        if self.keys():
+            m = max(list(map(len, list(self.keys())))) + 1
+            return '\n'.join([k.rjust(m) + ': ' + repr(v)
+                              for k, v in self.items()])
+        else:
+            return self.__class__.__name__ + "()"
+
+    def summary(self):
+        """Return a formatted string giving a quick summary
+        of the results."""
+
+        res = ("nlive: {:d}\n"
+               "niter: {:d}\n"
+               "ncall: {:d}\n"
+               "eff(%): {:6.3f}\n"
+               "logz: {:6.3f} +/- {:6.3f}"
+               .format(self.nlive, self.niter, sum(self.ncall),
+                       self.eff, self.logz[-1], self.logzerr[-1]))
+
+        print('Summary\n=======\n'+res)
+
+class Results2:
     """
     Contains the full output of a run along with a set of helper
     functions for summarizing the output.
     The object is meant to be unchangeable record of the static or
     dynamic nested run.
-    
-    Results attributes
+
+    Results attributes (name, type, description, array size):
     """
 
     _ALLOWED = set([_[0] for _ in _RESULTS_STRUCTURE])
@@ -318,10 +359,20 @@ class Results:
                 'or samples_n information')
         self._initialized = True
 
+    def __copy__(self):
+        # this will be a deep copy
+        return Results(self.asdict().items())
+
+    def copy(self):
+        '''
+        return a copy of the object
+        all numpy arrays will be copied too
+        '''
+        return self.__copy__()
+
     def __setattr__(self, name, value):
         if name[0] != '_' and self._initialized:
-            pass
-            #raise RuntimeError("Cannot set attributes directly")
+            raise RuntimeError("Cannot set attributes directly")
         super().__setattr__(name, value)
 
     def __getitem__(self, name):
@@ -352,6 +403,7 @@ Return the list of items in the results object as list of key,value pairs
         """
         Return contents of the Results object as dictionary
         """
+        # importantly here we copy attribute values
         return dict((k, copy.copy(getattr(self, k))) for k in self._keys)
 
     def isdynamic(self):
@@ -385,7 +437,8 @@ Return the list of items in the results object as list of key,value pairs
         print('Summary\n=======\n' + res)
 
 
-Results.__doc__ += str('\n'.join([str(_) for _ in _RESULTS_STRUCTURE]))
+Results.__doc__ += '\n\n' + str('\n'.join(
+    ['| ' + str(_) for _ in _RESULTS_STRUCTURE])) + '\n'
 
 
 def results_substitute(results, kw_dict):

@@ -52,15 +52,15 @@ else:
 
 
 setup(
-name='exostriker',  
-version='0.69',
-scripts=['scripts/exostriker'],
+name='qsostriker',  
+version='0.76',
+scripts=['scripts/qsostriker'],
 author="Trifon Trifonov",
 author_email="trifonov@mpia.de",
-description="This is the 'Transit and Radial velocity Interactive Fitting tool for Orbital analysis and N-body simulations: The Exo-Striker'",
+description="This is the QSO-Striker'",
 long_description=long_description,
 long_description_content_type="text/markdown",
-url="https://github.com/3fon3fonov/exostriker",
+url="https://github.com/3fon3fonov/QSO-striker",
 #packages=['exostriker'],
 packages=find_packages(),
 include_package_data = True,

@@ -11,17 +11,14 @@ import warnings
 import math
 import copy
 import numpy as np
-from scipy.special import logsumexp
 from .results import Results, print_fn
 from .bounding import UnitCube
 from .sampling import sample_unif
 from .utils import (get_seed_sequence, get_print_func, progress_integration,
-                    IteratorResult, RunRecord)
+                    IteratorResult, RunRecord, get_neff_from_logwt,
+                    compute_integrals, DelayTimer)
 
 __all__ = ["Sampler"]
-
-SQRTEPS = math.sqrt(float(np.finfo(np.float64).eps))
-MAXINT = 2**32 - 1
 
 
 class Sampler:
@@ -70,6 +67,7 @@ class Sampler:
         should be used to execute operations in parallel.
 
     """
+
     def __init__(self, loglikelihood, prior_transform, npdim, live_points,
                  update_interval, first_update, rstate, queue_size, pool,
                  use_pool, ncdim):
@@ -130,6 +128,8 @@ class Sampler:
         self.added_live = False  # whether leftover live points were used
         self.eff = 0.  # overall sampling efficiency
         self.cite = ''  # Default empty
+        self.save_samples = True
+        self.save_bounds = True
         # results
         self.saved_run = RunRecord()
 
@@ -139,30 +139,24 @@ class Sampler:
     def evolve_point(self, *args):
         raise RuntimeError('Should be overriden')
 
-    def update_proposal(self, *args):
+    def update_proposal(self, *args, **kwargs):
         raise RuntimeError('Should be overriden')
 
     def update(self):
         raise RuntimeError('Should be overriden')
 
+    def __setstate__(self, state):
+        self.__dict__ = state
+        self.pool = None
+        self.M = map
+
     def __getstate__(self):
         """Get state information for pickling."""
 
         state = self.__dict__.copy()
-
-        # attempt to remove from internal sampler, if not dealt within
-        # DynamicSampler class
-        try:
-            # remove random module
-            del state['rstate']
-
-            # deal with pool
-            if state['pool'] is not None:
-                del state['pool']  # remove pool
-                del state['M']  # remove `pool.map` function hook
-        except AttributeError:
-            pass
-
+        for k in ['M', 'pool']:
+            if k in state:
+                del state[k]
         return state
 
     def reset(self):
@@ -250,16 +244,12 @@ class Sampler:
         `1` if there is only one non-zero element in `wts`.
 
         """
-
-        if (len(self.saved_run.D['logwt']) == 0) or (np.max(
-                self.saved_run.D['logwt']) > 0.01 * np.nan_to_num(-np.inf)):
+        logwt = self.saved_run.D['logwt']
+        if len(logwt) == 0 or np.isneginf(np.max(logwt)):
             # If there are no saved weights, or its -inf return 0.
             return 0
         else:
-            # Otherwise, compute Kish ESS.
-            logwts = np.array(self.saved_run.D['logwt'])
-            logneff = logsumexp(logwts) * 2 - logsumexp(logwts * 2)
-            return np.exp(logneff)
+            return get_neff_from_logwt(np.asarray(logwt))
 
     @property
     def citations(self):
@@ -289,20 +279,6 @@ class Sampler:
             # saved log-likelihood threshold. (This is useful when sampling
             # within `dynamicsampler`).
             return loglstar >= self.logl_first_update
-
-    def _empty_queue(self):
-        """Dump all live point proposals currently on the queue."""
-
-        while True:
-            try:
-                # Remove unused points from the queue.
-                self.queue.pop()
-                self.unused += 1  # add to the total number of unused points
-                self.nqueue -= 1
-            except IndexError:
-                # If the queue is empty, we're done!
-                self.nqueue = 0
-                break
 
     def _fill_queue(self, loglstar):
         """Sequentially add new live point proposals to the queue."""
@@ -385,10 +361,13 @@ class Sampler:
             ucheck = ncall >= self.update_interval * (1 + nupdate)
             bcheck = self._beyond_unit_bound(loglstar)
 
-            # If our queue is empty, update any tuning parameters associated
-            # with our proposal (sampling) method.
-            if blob is not None and self.nqueue <= 0 and bcheck:
-                self.update_proposal(blob)
+            if blob is not None and bcheck:
+                # If our queue is empty, update any tuning parameters
+                # associated
+                # with our proposal (sampling) method.
+                # If it's not empty we are just accumulating the
+                # the history of evaluations
+                self.update_proposal(blob, update=self.nqueue <= 0)
 
             # If we satisfy the log-likelihood constraint, we're done!
             if logl > loglstar:
@@ -532,7 +511,8 @@ class Sampler:
                n_effective=np.inf,
                add_live=True,
                save_bounds=True,
-               save_samples=True):
+               save_samples=True,
+               resume=False):
         """
         **The main nested sampling loop.** Iteratively replace the worst live
         point with a sample drawn uniformly from the prior until the
@@ -642,7 +622,6 @@ class Sampler:
         self.save_samples = save_samples
         self.save_bounds = save_bounds
         ncall = 0
-
         # Check whether we're starting fresh or continuing a previous run.
         if self.it == 1 or len(self.saved_run.D['logl']) == 0:
             # Initialize values for nested sampling loop.
@@ -663,7 +642,7 @@ class Sampler:
                 self.since_update = 0
         else:
             # Remove live points (if added) from previous run.
-            if self.added_live:
+            if self.added_live and not resume:
                 self._remove_live_points()
 
             # Get final state from previous run.
@@ -671,7 +650,7 @@ class Sampler:
             logz = self.saved_run.D['logz'][-1]  # ln(evidence)
             logzvar = self.saved_run.D['logzvar'][-1]  # var[ln(evidence)]
             logvol = self.saved_run.D['logvol'][-1]  # ln(volume)
-            loglstar = min(self.live_logl)  # ln(likelihood)
+            loglstar = np.min(self.live_logl)  # ln(likelihood)
             delta_logz = np.logaddexp(
                 logz,
                 np.max(self.live_logl) + logvol) - logz  # log-evidence ratio
@@ -679,7 +658,6 @@ class Sampler:
         stop_iterations = False
         # The main nested sampling loop.
         for it in range(sys.maxsize):
-
             # Stopping criterion 1: current number of iterations
             # exceeds `maxiter`.
             if it > maxiter:
@@ -704,16 +682,17 @@ class Sampler:
 
             # Stopping criterion 5: the number of effective posterior
             # samples has been achieved.
-            if n_effective is not None:
-                if self.n_effective > n_effective:
+            if (n_effective is not None) and not np.isposinf(n_effective):
+                current_n_effective = self.n_effective
+                if current_n_effective > n_effective:
                     if add_live:
                         self.add_final_live(print_progress=False)
-                        neff = self.n_effective
+
+                        # Recompute n_effective after adding live points
+                        current_n_effective = self.n_effective
                         self._remove_live_points()
                         self.added_live = False
-                    else:
-                        neff = self.n_effective
-                    if neff > n_effective:
+                    if current_n_effective > n_effective:
                         stop_iterations = True
 
             if stop_iterations:
@@ -830,7 +809,10 @@ class Sampler:
                    add_live=True,
                    print_progress=True,
                    print_func=None,
-                   save_bounds=True):
+                   save_bounds=True,
+                   checkpoint_file=None,
+                   checkpoint_every=60,
+                   resume=False):
         """
         **A wrapper that executes the main nested sampling loop.**
         Iteratively replace the worst live point with a sample drawn
@@ -867,6 +849,7 @@ class Sampler:
             Minimum number of effective posterior samples. If the estimated
             "effective sample size" (ESS) exceeds this number,
             sampling will terminate. Default is no ESS (`np.inf`).
+            This option is deprecated and will be removed in a future release.
 
         add_live : bool, optional
             Whether or not to add the remaining set of live points to
@@ -886,6 +869,15 @@ class Sampler:
 
         """
 
+        # Check for deprecated options
+        if n_effective is not None:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("once")
+                warnings.warn(
+                    "The n_effective option to Sampler.run_nested is "
+                    "deprecated and will be removed in future releases",
+                    DeprecationWarning)
+
         # Define our stopping criteria.
         if dlogz is None:
             if add_live:
@@ -895,6 +887,8 @@ class Sampler:
 
         # Run the main nested sampling loop.
         pbar, print_func = get_print_func(print_func, print_progress)
+        if checkpoint_file is not None:
+            timer = DelayTimer(checkpoint_every)
         try:
             ncall = self.ncall
             for it, results in enumerate(
@@ -917,6 +911,9 @@ class Sampler:
                                dlogz=dlogz,
                                logl_max=logl_max)
 
+                if checkpoint_file is not None and timer.is_time():
+                    self.save(checkpoint_file)
+
             # Add remaining live points to samples.
             if add_live:
                 it = self.it - 1
@@ -931,6 +928,19 @@ class Sampler:
                                    add_live_it=i + 1,
                                    dlogz=dlogz,
                                    logl_max=logl_max)
+
+            # Here we recompute the integrals using the full run
+            new_logwt, new_logz, new_logzvar, new_h = compute_integrals(
+                logl=self.saved_run.D['logl'],
+                logvol=self.saved_run.D['logvol'])
+            self.saved_run.D['logwt'] = new_logwt.tolist()
+            self.saved_run.D['logz'] = new_logz.tolist()
+            self.saved_run.D['logzvar'] = new_logzvar.tolist()
+            self.saved_run.D['h'] = new_h.tolist()
+            if checkpoint_file is not None:
+                # I don't check the time timer here
+                self.save(checkpoint_file)
+
         finally:
             if pbar is not None:
                 pbar.close()

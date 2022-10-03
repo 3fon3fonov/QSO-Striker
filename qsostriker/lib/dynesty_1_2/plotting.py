@@ -44,6 +44,55 @@ def _make_subplots(fig, nx, ny, xsize, ysize):
     return fig, axes
 
 
+def rotate_ticks(ax, xy):
+    if xy == 'x':
+        labs = ax.get_xticklabels()
+    else:
+        labs = ax.get_yticklabels()
+    for lab in labs:
+        lab.set_rotation(45)
+
+
+def plot_thruth(ax,
+                truths,
+                truth_color,
+                truth_kwargs,
+                vertical=None,
+                horizontal=None):
+    """
+Plot the thruth line (horizontal or vertical).
+truths can be None or one value or a list
+"""
+    if vertical:
+        func = ax.axvline
+    elif horizontal:
+        func = ax.axhline
+    else:
+        raise ValueError('vertical or horizontal option must be specified')
+    if truths is not None:
+        try:
+            curt = iter(truths)
+        except TypeError:
+            curt = [truths]
+        for t in curt:
+            func(t, color=truth_color, **truth_kwargs)
+
+
+def check_span(span, samples, weights):
+    """
+If span is a list of scalars, replace it by the list of bounds.
+If the input is list of pairs, it is kept intact
+    """
+    for i, _ in enumerate(span):
+        try:
+            iter(span[i])
+            if len(span[i]) != 2:
+                raise ValueError('Incorrect span value')
+        except TypeError:
+            q = [0.5 - 0.5 * span[i], 0.5 + 0.5 * span[i]]
+            span[i] = _quantile(samples[i], q, weights=weights)
+
+
 def runplot(results,
             span=None,
             logplot=False,
@@ -152,11 +201,11 @@ def runplot(results,
 
     # Initialize values.
     if label_kwargs is None:
-        label_kwargs = dict()
+        label_kwargs = {}
     if plot_kwargs is None:
-        plot_kwargs = dict()
+        plot_kwargs = {}
     if truth_kwargs is None:
-        truth_kwargs = dict()
+        truth_kwargs = {}
 
     # Set defaults.
     plot_kwargs['linewidth'] = plot_kwargs.get('linewidth', 5)
@@ -195,7 +244,11 @@ def runplot(results,
             mark_final_live = False
 
     # Determine plotting bounds for each subplot.
-    data = [nlive, np.exp(logl), np.exp(logwt), np.exp(logz)]
+    data = [
+        nlive,
+        np.exp(logl),
+        np.exp(logwt), logz if logplot else np.exp(logz)
+    ]
     if kde:
         # Derive kernel density estimate.
         wt_kde = gaussian_kde(resample_equal(-logvol, data[2]))  # KDE
@@ -211,22 +264,30 @@ def runplot(results,
         raise ValueError("More bounds provided in `span` than subplots!")
     for i, _ in enumerate(span):
         try:
-            ymin, ymax = span[i]
-        except:
+            iter(span[i])
+            if len(span[i]) != 2:
+                raise ValueError('Incorrect span value')
+        except TypeError:
             span[i] = (max(data[i]) * span[i], max(data[i]))
     if lnz_error and no_span:
         if logplot:
-            zspan = (np.exp(logz[-1] - 1.3 * 3. * logzerr[-1]),
-                     np.exp(logz[-1] + 1.3 * 3. * logzerr[-1]))
+            # Same lower bound as in ultranest:
+            # https://github.com/JohannesBuchner/UltraNest/blob/master/ultranest/plot.py#L139.
+            zspan = (logz[-1] - 10.3 * 3. * logzerr[-1],
+                     logz[-1] + 1.3 * 3. * logzerr[-1])
         else:
             zspan = (0., 1.05 * np.exp(logz[-1] + 3. * logzerr[-1]))
         span[3] = zspan
 
     # Setting up default plot layout.
+    had_fig = fig or False
     fig, axes = _make_subplots(fig, 4, 1, 16, 16)
     axes = axes.flatten()
     xspan = [ax.get_xlim() for ax in axes]
-    yspan = [ax.get_ylim() for ax in axes]
+    if had_fig:
+        yspan = [ax.get_ylim() for ax in axes]
+    else:
+        yspan = span
     # One exception: if the bounds are the plotting default `(0., 1.)`,
     # overwrite them.
     xspan = [t if t != (0., 1.) else (0., -min(logvol)) for t in xspan]
@@ -256,7 +317,7 @@ def runplot(results,
     # Plotting.
     labels = [
         'Live Points', 'Likelihood\n(normalized)', 'Importance\nWeight',
-        'Evidence'
+        'log(Evidence)' if logplot else 'Evidence'
     ]
     if kde:
         labels[2] += ' PDF'
@@ -286,20 +347,30 @@ def runplot(results,
         ax.set_ylabel(labels[i], **label_kwargs)
         # Plot run.
         if logplot and i == 3:
-            ax.semilogy(-logvol, d, color=c, **plot_kwargs)
+            ax.plot(-logvol, d, color=c, **plot_kwargs)
             yspan = [ax.get_ylim() for _ax in axes]
         elif kde and i == 2:
             ax.plot(-logvol_new, d, color=c, **plot_kwargs)
         else:
             ax.plot(-logvol, d, color=c, **plot_kwargs)
         if i == 3 and lnz_error:
-            [
-                ax.fill_between(-logvol,
-                                np.exp(logz + s * logzerr),
-                                np.exp(logz - s * logzerr),
-                                color=c,
-                                alpha=0.2) for s in range(1, 4)
-            ]
+            if logplot:
+                # Same mask as in ultranest:
+                # https://github.com/JohannesBuchner/UltraNest/blob/master/ultranest/plot.py#L139
+                mask = logz >= ax.get_ylim()[0] - 10
+                for s in range(1, 4):
+                    ax.fill_between(-logvol[mask], (logz + s * logzerr)[mask],
+                                    (logz - s * logzerr)[mask],
+                                    color=c,
+                                    alpha=0.2)
+            else:
+                for s in range(1, 4):
+                    ax.fill_between(-logvol,
+                                    np.exp(logz + s * logzerr),
+                                    np.exp(logz - s * logzerr),
+                                    color=c,
+                                    alpha=0.2)
+
         # Mark addition of final live points.
         if mark_final_live:
             ax.axvline(-logvol[live_idx],
@@ -311,14 +382,19 @@ def runplot(results,
                 ax.axhline(live_idx, color=c, ls="dashed", lw=2, **plot_kwargs)
         # Add truth value(s).
         if i == 3 and lnz_truth is not None:
-            ax.axhline(np.exp(lnz_truth), color=truth_color, **truth_kwargs)
+            if logplot:
+                ax.axhline(lnz_truth, color=truth_color, **truth_kwargs)
+            else:
+                ax.axhline(np.exp(lnz_truth),
+                           color=truth_color,
+                           **truth_kwargs)
 
     return fig, axes
 
 
 def traceplot(results,
               span=None,
-              quantiles=[0.025, 0.5, 0.975],
+              quantiles=(0.025, 0.5, 0.975),
               smooth=0.02,
               thin=1,
               dims=None,
@@ -338,7 +414,7 @@ def traceplot(results,
               labels=None,
               label_kwargs=None,
               show_titles=False,
-              title_quantiles=[0.025, 0.5, 0.975],
+              title_quantiles=(0.025, 0.5, 0.975),
               title_fmt=".2f",
               title_kwargs=None,
               truths=None,
@@ -505,17 +581,17 @@ def traceplot(results,
 
     # Initialize values.
     if title_kwargs is None:
-        title_kwargs = dict()
+        title_kwargs = {}
     if label_kwargs is None:
-        label_kwargs = dict()
+        label_kwargs = {}
     if trace_kwargs is None:
-        trace_kwargs = dict()
+        trace_kwargs = {}
     if connect_kwargs is None:
-        connect_kwargs = dict()
+        connect_kwargs = {}
     if post_kwargs is None:
-        post_kwargs = dict()
+        post_kwargs = {}
     if truth_kwargs is None:
-        truth_kwargs = dict()
+        truth_kwargs = {}
 
     # Set defaults.
     connect_kwargs['alpha'] = connect_kwargs.get('alpha', 0.7)
@@ -529,10 +605,8 @@ def traceplot(results,
     # Extract weighted samples.
     samples = results['samples']
     logvol = results['logvol']
-    try:
-        weights = np.exp(results['logwt'] - results['logz'][-1])
-    except KeyError:
-        weights = results['weights']
+    weights = np.exp(results['logwt'] - results['logz'][-1])
+
     if kde:
         # Derive kernel density estimate.
         wt_kde = gaussian_kde(resample_equal(-logvol, weights))  # KDE
@@ -590,19 +664,14 @@ def traceplot(results,
     span = list(span)
     if len(span) != ndim:
         raise ValueError("Dimension mismatch between samples and span.")
-    for i, _ in enumerate(span):
-        try:
-            xmin, xmax = span[i]
-        except:
-            q = [0.5 - 0.5 * span[i], 0.5 + 0.5 * span[i]]
-            span[i] = _quantile(samples[i], q, weights=weights)
+    check_span(span, samples, weights)
 
     # Setting up labels.
     if labels is None:
         labels = [r"$x_{" + str(i + 1) + "}$" for i in range(ndim)]
 
     # Setting up smoothing.
-    if (isinstance(smooth, int_type) or isinstance(smooth, float_type)):
+    if isinstance(smooth, (int_type, float_type)):
         smooth = [smooth for i in range(ndim)]
 
     # Setting up default plot layout.
@@ -656,14 +725,12 @@ def traceplot(results,
                         color=connect_color,
                         **connect_kwargs)
         # Add truth value(s).
-        if truths is not None and truths[i] is not None:
-            try:
-                [
-                    ax.axhline(t, color=truth_color, **truth_kwargs)
-                    for t in truths[i]
-                ]
-            except:
-                ax.axhline(truths[i], color=truth_color, **truth_kwargs)
+        if truths is not None:
+            plot_thruth(ax,
+                        truths[i],
+                        truth_color,
+                        truth_kwargs,
+                        horizontal=True)
 
         # Plot marginalized 1-D posterior.
 
@@ -719,16 +786,14 @@ def traceplot(results,
                 ax.axvline(q, lw=2, ls="dashed", color=color)
             if verbose:
                 print("Quantiles:")
-                print(labels[i], [blob for blob in zip(quantiles, qs)])
+                print(labels[i], list(zip(quantiles, qs)))
         # Add truth value(s).
-        if truths is not None and truths[i] is not None:
-            try:
-                [
-                    ax.axvline(t, color=truth_color, **truth_kwargs)
-                    for t in truths[i]
-                ]
-            except:
-                ax.axvline(truths[i], color=truth_color, **truth_kwargs)
+        if truths is not None:
+            plot_thruth(ax,
+                        truths[i],
+                        truth_color,
+                        truth_kwargs,
+                        vertical=True)
         # Set titles.
         if show_titles:
             title = None
@@ -855,11 +920,11 @@ def cornerpoints(results,
 
     # Initialize values.
     if truth_kwargs is None:
-        truth_kwargs = dict()
+        truth_kwargs = {}
     if label_kwargs is None:
-        label_kwargs = dict()
+        label_kwargs = {}
     if plot_kwargs is None:
-        plot_kwargs = dict()
+        plot_kwargs = {}
 
     # Set defaults.
     plot_kwargs['s'] = plot_kwargs.get('s', 1)
@@ -872,10 +937,8 @@ def cornerpoints(results,
     # Extract weighted samples.
     samples = results['samples']
     logvol = results['logvol']
-    try:
-        weights = np.exp(results['logwt'] - results['logz'][-1])
-    except:
-        weights = results['weights']
+    weights = np.exp(results['logwt'] - results['logz'][-1])
+
     if kde:
         # Derive kernel density estimate.
         wt_kde = gaussian_kde(resample_equal(-logvol, weights))  # KDE
@@ -911,12 +974,7 @@ def cornerpoints(results,
     if span is not None:
         if len(span) != ndim:
             raise ValueError("Dimension mismatch between samples and span.")
-        for i, _ in enumerate(span):
-            try:
-                xmin, xmax = span[i]
-            except:
-                q = [0.5 - 0.5 * span[i], 0.5 + 0.5 * span[i]]
-                span[i] = _quantile(samples[i], q, weights=weights)
+        check_span(span, samples, weights)
 
     # Set labels
     if labels is None:
@@ -978,13 +1036,13 @@ def cornerpoints(results,
             if i < ndim - 2:
                 ax.set_xticklabels([])
             else:
-                [l.set_rotation(45) for l in ax.get_xticklabels()]
+                rotate_ticks(ax, 'x')
                 ax.set_xlabel(labels[j], **label_kwargs)
                 ax.xaxis.set_label_coords(0.5, -0.3)
             if j > 0:
                 ax.set_yticklabels([])
             else:
-                [l.set_rotation(45) for l in ax.get_yticklabels()]
+                rotate_ticks(ax, 'y')
                 ax.set_ylabel(labels[i + 1], **label_kwargs)
                 ax.yaxis.set_label_coords(-0.3, 0.5)
             # Plot distribution.
@@ -1004,26 +1062,16 @@ def cornerpoints(results,
                        **plot_kwargs)
             # Add truth values
             if truths is not None:
-                if truths[j] is not None:
-                    try:
-                        [
-                            ax.axvline(t, color=truth_color, **truth_kwargs)
-                            for t in truths[j]
-                        ]
-                    except:
-                        ax.axvline(truths[j],
-                                   color=truth_color,
-                                   **truth_kwargs)
-                if truths[i + 1] is not None:
-                    try:
-                        [
-                            ax.axhline(t, color=truth_color, **truth_kwargs)
-                            for t in truths[i + 1]
-                        ]
-                    except:
-                        ax.axhline(truths[i + 1],
-                                   color=truth_color,
-                                   **truth_kwargs)
+                plot_thruth(ax,
+                            truths[j],
+                            truth_color,
+                            truth_kwargs,
+                            vertical=True)
+                plot_thruth(ax,
+                            truths[i + 1],
+                            truth_color,
+                            truth_kwargs,
+                            horizontal=True)
 
     return (fig, axes)
 
@@ -1031,7 +1079,7 @@ def cornerpoints(results,
 def cornerplot(results,
                dims=None,
                span=None,
-               quantiles=[0.025, 0.5, 0.975],
+               quantiles=(0.025, 0.5, 0.975),
                color='black',
                smooth=0.02,
                quantiles_2d=None,
@@ -1040,7 +1088,7 @@ def cornerplot(results,
                labels=None,
                label_kwargs=None,
                show_titles=False,
-               title_quantiles=[0.025, 0.5, 0.975],
+               title_quantiles=(0.025, 0.5, 0.975),
                title_fmt=".2f",
                title_kwargs=None,
                truths=None,
@@ -1176,19 +1224,18 @@ def cornerplot(results,
     if quantiles is None:
         quantiles = []
     if truth_kwargs is None:
-        truth_kwargs = dict()
+        truth_kwargs = {}
     if label_kwargs is None:
-        label_kwargs = dict()
+        label_kwargs = {}
     if title_kwargs is None:
-        title_kwargs = dict()
+        title_kwargs = {}
     if hist_kwargs is None:
-        hist_kwargs = dict()
+        hist_kwargs = {}
     if hist2d_kwargs is None:
-        hist2d_kwargs = dict()
+        hist2d_kwargs = {}
 
     # Set defaults.
     hist_kwargs['alpha'] = hist_kwargs.get('alpha', 0.6)
-    hist2d_kwargs['alpha'] = hist2d_kwargs.get('alpha', 0.6)
     hist2d_kwargs['levels'] = hist2d_kwargs.get('levels', quantiles_2d)
     truth_kwargs['linestyle'] = truth_kwargs.get('linestyle', 'solid')
     truth_kwargs['linewidth'] = truth_kwargs.get('linewidth', 2)
@@ -1196,10 +1243,7 @@ def cornerplot(results,
 
     # Extract weighted samples.
     samples = results['samples']
-    try:
-        weights = np.exp(results['logwt'] - results['logz'][-1])
-    except:
-        weights = results['weights']
+    weights = np.exp(results['logwt'] - results['logz'][-1])
 
     # Deal with 1D results. A number of extra catches are also here
     # in case users are trying to plot other results besides the `Results`
@@ -1230,19 +1274,14 @@ def cornerplot(results,
     span = list(span)
     if len(span) != ndim:
         raise ValueError("Dimension mismatch between samples and span.")
-    for i, _ in enumerate(span):
-        try:
-            xmin, xmax = span[i]
-        except:
-            q = [0.5 - 0.5 * span[i], 0.5 + 0.5 * span[i]]
-            span[i] = _quantile(samples[i], q, weights=weights)
+    check_span(span, samples, weights)
 
     # Set labels
     if labels is None:
         labels = [r"$x_{" + str(i + 1) + "}$" for i in range(ndim)]
 
     # Setting up smoothing.
-    if (isinstance(smooth, int_type) or isinstance(smooth, float_type)):
+    if isinstance(smooth, (int_type, float_type)):
         smooth = [smooth for i in range(ndim)]
 
     # Setup axis layout (from `corner.py`).
@@ -1286,11 +1325,11 @@ def cornerplot(results,
         if i < ndim - 1:
             if top_ticks:
                 ax.xaxis.set_ticks_position("top")
-                [l.set_rotation(45) for l in ax.get_xticklabels()]
+                rotate_ticks(ax, 'x')
             else:
                 ax.set_xticklabels([])
         else:
-            [l.set_rotation(45) for l in ax.get_xticklabels()]
+            rotate_ticks(ax, 'x')
             ax.set_xlabel(labels[i], **label_kwargs)
             ax.xaxis.set_label_coords(0.5, -0.3)
         # Generate distribution.
@@ -1329,16 +1368,14 @@ def cornerplot(results,
                 ax.axvline(q, lw=2, ls="dashed", color=color)
             if verbose:
                 print("Quantiles:")
-                print(labels[i], [blob for blob in zip(quantiles, qs)])
+                print(labels[i], list(zip(quantiles, qs)))
         # Add truth value(s).
-        if truths is not None and truths[i] is not None:
-            try:
-                [
-                    ax.axvline(t, color=truth_color, **truth_kwargs)
-                    for t in truths[i]
-                ]
-            except:
-                ax.axvline(truths[i], color=truth_color, **truth_kwargs)
+        if truths is not None:
+            plot_thruth(ax,
+                        truths[i],
+                        truth_color,
+                        truth_kwargs,
+                        vertical=True)
         # Set titles.
         if show_titles:
             title = None
@@ -1383,13 +1420,13 @@ def cornerplot(results,
             if i < ndim - 1:
                 ax.set_xticklabels([])
             else:
-                [l.set_rotation(45) for l in ax.get_xticklabels()]
+                rotate_ticks(ax, 'x')
                 ax.set_xlabel(labels[j], **label_kwargs)
                 ax.xaxis.set_label_coords(0.5, -0.3)
             if j > 0:
                 ax.set_yticklabels([])
             else:
-                [l.set_rotation(45) for l in ax.get_yticklabels()]
+                rotate_ticks(ax, 'y')
                 ax.set_ylabel(labels[i], **label_kwargs)
                 ax.yaxis.set_label_coords(-0.3, 0.5)
             # Generate distribution.
@@ -1416,26 +1453,16 @@ def cornerplot(results,
                     **hist2d_kwargs)
             # Add truth values
             if truths is not None:
-                if truths[j] is not None:
-                    try:
-                        [
-                            ax.axvline(t, color=truth_color, **truth_kwargs)
-                            for t in truths[j]
-                        ]
-                    except:
-                        ax.axvline(truths[j],
-                                   color=truth_color,
-                                   **truth_kwargs)
-                if truths[i] is not None:
-                    try:
-                        [
-                            ax.axhline(t, color=truth_color, **truth_kwargs)
-                            for t in truths[i]
-                        ]
-                    except:
-                        ax.axhline(truths[i],
-                                   color=truth_color,
-                                   **truth_kwargs)
+                plot_thruth(ax,
+                            truths[j],
+                            truth_color,
+                            truth_kwargs,
+                            vertical=True)
+                plot_thruth(ax,
+                            truths[i],
+                            truth_color,
+                            truth_kwargs,
+                            horizontal=True)
 
     return (fig, axes)
 
@@ -1560,11 +1587,11 @@ def boundplot(results,
 
     # Initialize values.
     if plot_kwargs is None:
-        plot_kwargs = dict()
+        plot_kwargs = {}
     if label_kwargs is None:
-        label_kwargs = dict()
+        label_kwargs = {}
     if live_kwargs is None:
-        live_kwargs = dict()
+        live_kwargs = {}
 
     # Check that either `idx` or `it` has been specified.
     if (it is None and idx is None) or (it is not None and idx is not None):
@@ -1595,7 +1622,7 @@ def boundplot(results,
         # Extract bound iterations.
         try:
             bound_iter = np.array(results['bound_iter'])
-        except:
+        except KeyError:
             raise ValueError("Cannot reconstruct the bound used at the "
                              "specified iteration since bound "
                              "iterations were not saved in the results.")
@@ -1611,7 +1638,7 @@ def boundplot(results,
                              "number of samples in the run.")
         try:
             samples_bound = results['samples_bound']
-        except:
+        except KeyError:
             raise ValueError("Cannot reconstruct the bound used to "
                              "compute the specified dead point since "
                              "sample bound indices were not saved "
@@ -1675,8 +1702,7 @@ def boundplot(results,
                 live_u[uidx] = samples[r]
     rstate = get_random_generator()
     # Draw samples from the bounding distribution.
-    if not isinstance(bound, bounding.RadFriends) and not isinstance(
-            bound, bounding.SupFriends):
+    if not isinstance(bound, (bounding.RadFriends, bounding.SupFriends)):
         # If bound is "fixed", go ahead and draw samples from it.
         psamps = bound.samples(ndraws, rstate=rstate)
     else:
@@ -1879,11 +1905,11 @@ def cornerbound(results,
 
     # Initialize values.
     if label_kwargs is None:
-        label_kwargs = dict()
+        label_kwargs = {}
     if plot_kwargs is None:
-        plot_kwargs = dict()
+        plot_kwargs = {}
     if live_kwargs is None:
-        live_kwargs = dict()
+        live_kwargs = {}
 
     # Check that either `idx` or `it` is specified.
     if (it is None and idx is None) or (it is not None and idx is not None):
@@ -2000,10 +2026,10 @@ def cornerbound(results,
 
     rstate = get_random_generator()
     # Draw samples from the bounding distribution.
-    try:
+    if not isinstance(bound, (bounding.RadFriends, bounding.SupFriends)):
         # If bound is "fixed", go ahead and draw samples from it.
         psamps = bound.samples(ndraws, rstate=rstate)
-    except:
+    else:
         # If bound is based on the distribution of live points at a
         # specific iteration, we need to reconstruct what those were.
         if not show_live:
@@ -2105,13 +2131,13 @@ def cornerbound(results,
             if i < ndim - 2:
                 ax.set_xticklabels([])
             else:
-                [l.set_rotation(45) for l in ax.get_xticklabels()]
+                rotate_ticks(ax, 'x')
                 ax.set_xlabel(labels[j], **label_kwargs)
                 ax.xaxis.set_label_coords(0.5, -0.3)
             if j > 0:
                 ax.set_yticklabels([])
             else:
-                [l.set_rotation(45) for l in ax.get_yticklabels()]
+                rotate_ticks(ax, 'y')
                 ax.set_ylabel(labels[i + 1], **label_kwargs)
                 ax.yaxis.set_label_coords(-0.3, 0.5)
             # Plot distribution.
@@ -2138,8 +2164,7 @@ def _hist2d(x,
             fill_contours=True,
             contour_kwargs=None,
             contourf_kwargs=None,
-            data_kwargs=None,
-            **kwargs):
+            data_kwargs=None):
     """
     Internal function called by :meth:`cornerplot` used to generate a
     a 2-D histogram/contour of samples.
@@ -2215,12 +2240,7 @@ def _hist2d(x,
     span = list(span)
     if len(span) != 2:
         raise ValueError("Dimension mismatch between samples and span.")
-    for i, _ in enumerate(span):
-        try:
-            xmin, xmax = span[i]
-        except:
-            q = [0.5 - 0.5 * span[i], 0.5 + 0.5 * span[i]]
-            span[i] = _quantile(data[i], q, weights=weights)
+    check_span(span, data, weights)
 
     # The default "sigma" contour levels.
     if levels is None:
@@ -2239,12 +2259,13 @@ def _hist2d(x,
     # This "color map" is the list of colors for the contour levels if the
     # contours are filled.
     rgba_color = colorConverter.to_rgba(color)
-    contour_cmap = [list(rgba_color) for l in levels] + [rgba_color]
-    for i, l in enumerate(levels):
-        contour_cmap[i][-1] *= float(i) / (len(levels) + 1)
+    n_levels = len(levels)
+    contour_cmap = [list(rgba_color)] * n_levels + [rgba_color]
+    for i in range(n_levels):
+        contour_cmap[i][-1] *= float(i) / (n_levels + 1)
 
     # Initialize smoothing.
-    if (isinstance(smooth, int_type) or isinstance(smooth, float_type)):
+    if isinstance(smooth, (int_type, float_type)):
         smooth = [smooth, smooth]
     bins = []
     svalues = []
@@ -2326,7 +2347,7 @@ def _hist2d(x,
     # Plot the data points.
     if plot_datapoints:
         if data_kwargs is None:
-            data_kwargs = dict()
+            data_kwargs = {}
         data_kwargs["color"] = data_kwargs.get("color", color)
         data_kwargs["ms"] = data_kwargs.get("ms", 2.0)
         data_kwargs["mec"] = data_kwargs.get("mec", "none")
@@ -2343,7 +2364,7 @@ def _hist2d(x,
 
     if plot_contours and fill_contours:
         if contourf_kwargs is None:
-            contourf_kwargs = dict()
+            contourf_kwargs = {}
         contourf_kwargs["colors"] = contourf_kwargs.get("colors", contour_cmap)
         contourf_kwargs["antialiased"] = contourf_kwargs.get(
             "antialiased", False)
@@ -2359,7 +2380,7 @@ def _hist2d(x,
     # Plot the contour edge colors.
     if plot_contours:
         if contour_kwargs is None:
-            contour_kwargs = dict()
+            contour_kwargs = {}
         contour_kwargs["colors"] = contour_kwargs.get("colors", color)
         ax.contour(X2, Y2, H2.T, V, **contour_kwargs)
 

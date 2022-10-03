@@ -30,7 +30,7 @@ import gls as gls
 
 TAU= 2.0*np.pi
 
-
+matplotlib.rcParams['axes.formatter.useoffset'] = False
 
 def check_for_missing_instances(fit,fit_new):
     
@@ -57,6 +57,11 @@ def check_for_missing_instances(fit,fit_new):
         except:
             pass
 
+    if len(fit_new.type_fit) != 4:
+        try:
+            fit_new.type_fit = dill.copy(fit.type_fit)
+        except:
+            pass        
 
 
     if len(fit_new.tra_colors) <= 11:
@@ -107,7 +112,7 @@ def check_fortran_routines(path='./'):
         result2, flag2 = run_command_with_timeout('gfortran -O3 %s/source/latest_f/kepfit_LM.f -o %s/lib/fr/chi2_kep'%(path,path), 15,output=True)
         result2, flag2 = run_command_with_timeout('%s/lib/fr/chi2_kep -version'%path, 1,output=True)
 
-    version_dyn_loglik= "0.09"
+    version_dyn_loglik= "0.10"
     result3, flag3 = run_command_with_timeout('%s/lib/fr/loglik_dyn -version'%path, 1,output=True)
     if flag3 == -1 or str(result3[0][0]) != version_dyn_loglik:
         print("New source code available: Updating N-body Simplex")   
@@ -121,9 +126,9 @@ def check_fortran_routines(path='./'):
         result4, flag4 = run_command_with_timeout('gfortran -O3 %s/source/latest_f/dynfit_LM.f -o %s/lib/fr/chi2_dyn'%(path,path), 15,output=True)
         result4, flag4 = run_command_with_timeout('%s/lib/fr/chi2_dyn -version'%path, 1,output=True)
 
-    version_dyn_loglik_= "0.06"
+    version_dyn_loglik_plus = "0.07"
     result5, flag5 = run_command_with_timeout('%s/lib/fr/loglik_dyn+ -version'%path, 1,output=True)
-    if flag5 == -1 or str(result5[0][0]) != version_dyn_loglik_:
+    if flag5 == -1 or str(result5[0][0]) != version_dyn_loglik_plus:
         print("New source code available: Updating Mixed Simplex")
         result5, flag5 = run_command_with_timeout('gfortran -O3 %s/source/latest_f/dynfit_amoeba+.f -o %s/lib/fr/loglik_dyn+'%(path,path), 15,output=True)
         result5, flag5 = run_command_with_timeout('%s/lib/fr/loglik_dyn+ -version'%path, 1,output=True)
@@ -347,7 +352,7 @@ def get_mass(K, P, ecc, i, Stellar_mass):
     GMSUN = 1.32712497e20
     msini = (T/(2.0*np.pi*GMSUN))**THIRD * K * Stellar_mass**(2./3) * np.sqrt(1.0-ecc**2.0)
     
-    msini = msini/np.sin(np.radians(i))*1047.70266835 
+    msini = msini/np.sin(np.radians(i))*1047.348644
     
     return msini  
 
@@ -433,10 +438,111 @@ def get_transit_times(tr_res, p, t0, precise = False, verbose=False):
     return [tr_index, tr_t0]
 
 
+############################ density ###########################################
+def get_density(m_p, r_p, d_m_p=None, d_r_p=None):
+    """
+    # m_p in Sol
+    # r_p in Sol
+
+    Warning! You must do:  rho = get_density(pl_mass_kg*1000.0, pl_radii_m*100.0) to get
+    rho in [g cm^-3]
+    """
+                              
+    solarrad2m = 6.957e8
+    solarmass2kg = 1.9891e30
+
+    r_p = r_p*solarrad2m
+    m_p = m_p*solarmass2kg
+    const =  (4.0/3.0) * np.pi   
+ 
+    volume =  const * (r_p ** 3.0)
+    rho = m_p/volume
+
+    if d_m_p != None:
+        d_m_p = d_m_p*solarmass2kg
+        d_r_p = d_r_p*solarrad2m
+        delta_rho = np.sqrt( (d_m_p**2*r_p**2) + (9*d_r_p**2 * m_p**2)   ) / (const*r_p**4)
+    else:
+        delta_rho = 0.0        
+ 
+    return rho,delta_rho
 
 
 
-####################### mass_semimajor ###########################################
+####################### mass_semimajor #########################################
+def get_mass_a_samples(K, P, ecc, incl, m_s, mass_type="J"):
+    '''Calculates the actual masses and Jacobi semimajor axes of a
+       system for using the parameters P, K and e from a Kepler fit.
+       The output of the semi-major axis is in AU.
+       if mass_type="J" the mass is in Jupiter masses (deafault)
+       if mass_type="E" the mass is in Erath masses (deafault)
+       else, e.g.,        mass_type="" mass is in Solar units.
+    '''
+    THIRD = 1.0/3.0
+    PI    = 3.14159265358979e0
+    TWOPI = 2.0*PI
+    GMSUN = 1.32712497e20
+    AU=1.49597892e11
+    
+    mass = np.zeros(10)
+    ap    = np.zeros(9)
+    pl_mass = np.zeros(9)
+    mpold = pl_mass
+
+#*******G is set to be unit, and s, m, kg as unit of time, length and mass
+#*****  and there is a reason for that! later I might correct for that.
+    mtotal = m_s
+    f = 5e-6
+
+    #mass[0] = m_s
+
+
+    for i in range(len(K)):
+
+        T = P[i]*86400.0
+
+        # we need innitial guess for each planet mass
+        dm =2      
+        mass[i+1] = abs(K[i])*(T*m_s**2.0/(TWOPI*GMSUN))**THIRD * np.sqrt(1.0-ecc[i]**2.0)/abs(np.sin(np.radians(incl[i])))
+        #mpold[i] = mass[i+1]
+        # This is a simple iteration to solve for mp
+        mass[0] = m_s
+        mpold[i] = 0
+
+        while (dm >= f):
+ 
+            if i == 0:
+                mtotal = m_s
+                mass[i+1] = abs(K[i])*(T*(m_s + mpold[i])**2.0/(TWOPI*GMSUN))**THIRD * np.sqrt(1.0-ecc[i]**2.0)/abs(np.sin(np.radians(incl[i])))
+            else:
+                mtotal = m_s
+                for j in range(i):
+                    mtotal = mtotal + mass[j+1]
+                mass[i+1] = abs(K[i])*(T*(mtotal + mpold[i])**2.0/(TWOPI*GMSUN))**THIRD * np.sqrt(1.0-ecc[i]**2.0)/abs(np.sin(np.radians(incl[i])))
+
+            #dm = (mpold[i] - mass[i+1])
+            dm = abs((mass[i+1] - mpold[i])/mass[i+1] )
+
+            mpold[i] =  mass[i+1]
+ 
+
+        ap[i] = (GMSUN*(mtotal + mass[i+1])*(T/TWOPI)**2)**THIRD
+ 
+    for i in range(len(K)):
+
+        ap[i] = ap[i]/AU # to be in AU
+        if mass_type=="J":
+            pl_mass[i] = mass[i+1]*1047.348644 # to be in Jup. masses
+        elif  mass_type=="E":
+            pl_mass[i] = mass[i+1]*1047.348644 * 317.82838 # to be in Earth. masses
+        else:
+            pl_mass[i] = mass[i+1]
+            
+            
+        # I have seen that 1 Sol Mass = 1047.92612 Jup. masses???
+    return pl_mass,ap
+
+####################### mass_semimajor #########################################
 def get_mass_a(obj, mass_type="J"):
     '''Calculates the actual masses and Jacobi semimajor axes of a
        system for using the parameters P, K and e from a Kepler fit.
@@ -492,9 +598,9 @@ def get_mass_a(obj, mass_type="J"):
 
         ap[i] = ap[i]/AU # to be in AU
         if mass_type=="J":
-            pl_mass[i] = mass[i+1]*1047.70266835 # to be in Jup. masses
+            pl_mass[i] = mass[i+1]*1047.348644 # to be in Jup. masses
         elif  mass_type=="E":
-            pl_mass[i] = mass[i+1]*1047.70266835 * 317.82838 # to be in Earth. masses
+            pl_mass[i] = mass[i+1]*1047.348644 * 317.82838 # to be in Earth. masses
         else:
             pl_mass[i] = mass[i+1]
             
@@ -958,30 +1064,33 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
             else:
                 samp_best_fit_par.append((Ma_[np.argmax(ln)] + omega_[np.argmax(ln)])%360.0 )            
         
-    if mod_labels['mass']:
+
+    if mod_labels['mass'] or mod_labels['semimajor']:
         
         m_s   = np.random.normal(loc=obj.stellar_mass,      scale=obj.stellar_mass_err,      size=len(ss))
-        
+        K,P, ecc, esinw, ecosw, incl,masses,semimajor = [],[],[],[],[],[],[],[]
+
         for i in range(obj.npl):
             let = letters[i]
             
+
             if not 'K$_%s$'%let in labels or not 'P$_%s$'%let in labels:
                 continue
             
-            K   = np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'K$_%s$'%let]])
-            P   = np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'P$_%s$'%let]])
+            K.append(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'K$_%s$'%let]]))
+            P.append(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'P$_%s$'%let]]))
                         
             if obj.hkl == True and '$e sin(\omega_%s)$'%let in labels and '$e cos(\omega_%s)$'%let in labels:
  
-                esinw = np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == '$e sin(\omega_%s)$'%let]]) 
-                ecosw = np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == '$e cos(\omega_%s)$'%let]]) 
+                esinw.append(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == '$e sin(\omega_%s)$'%let]]))
+                ecosw.append(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == '$e cos(\omega_%s)$'%let]]))
                 
-                ecc = np.sqrt(esinw**2 + ecosw**2)
+                ecc.append(np.sqrt(esinw[i]**2 + ecosw[i]**2))
             elif obj.hkl == False and 'e$_%s$'%let in labels:
-                ecc = np.array(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'e$_%s$'%let]]), dtype=np.float64) 
+                ecc.append(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'e$_%s$'%let]]))
 
             else:
-                ecc = np.array([0]*len(K), dtype=np.float64) 
+                ecc.append([0]*len(K[i]))
                 print("Warning, no eccentricity samples found for planet %s ! Assuming ecc = 0"%str(i+1))
 
             if mod_labels['use_Me']:
@@ -991,56 +1100,70 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
                 M_fact = 1
                 mass_lab = r'[M$_{\rm Jup.}$]'
             elif mod_labels['use_Ms']:
-                M_fact = 1.0/1047.0
+                M_fact = 1.0/1047.348644
                 mass_lab = r'[M$_\odot$]'
 
             
             if 'i$_%s$'%let in labels:
-                incl   = np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'i$_%s$'%let]])
+                incl.append(np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'i$_%s$'%let]]))
                 samp_labels.append(r'm$_%s$ %s'%(let,mass_lab))
             else:
-                incl = np.array([90]*len(K))
-                samp_labels.append(r'm $\sin i_%s$ %s'%(let,mass_lab))
-
+                if obj.copl_incl == True:
+                    incl.append(incl[0])     
+                else:
+                    incl.append([obj.i[i]]*len(K[i]))
+                if obj.i[i] == 90.0:
+                    samp_labels.append(r'm $\sin i_%s$ %s'%(let,mass_lab))
+                else:
+                    samp_labels.append(r'm$_%s$ %s'%(let,mass_lab))
  
-            samp.append(np.array(get_mass(K,P, ecc, incl, m_s) * M_fact))
-            
-            if mod_labels['mean']:
-                samp_best_fit_par.append(get_mass(np.mean(K),np.mean(P),np.mean(ecc), np.mean(incl), np.mean(m_s)) * M_fact)
-            elif mod_labels['median']:
-                samp_best_fit_par.append(get_mass(np.median(K),np.median(P),np.median(ecc), np.median(incl), np.median(m_s)) *M_fact)
-            elif mod_labels['best_gui']:
-                samp_best_fit_par.append(obj.masses[i]*M_fact)                
-            else:
-                samp_best_fit_par.append(get_mass(K[np.argmax(ln)],P[np.argmax(ln)], ecc[np.argmax(ln)], incl[np.argmax(ln)], obj.stellar_mass)*M_fact)
-    
-    
-    if mod_labels['semimajor']:
-        
-        if len(m_s) == 0:
-            m_s   = np.random.normal(loc=obj.stellar_mass,      scale=obj.stellar_mass_err,      size=len(samples[:,0]))
-            
-        
-        for i in range(obj.npl):
-            let = letters[i]
-            
-            if not 'P$_%s$'%let in labels:
-                continue            
-            
-            P   = np.hstack(samples[:,[ii for ii, j in enumerate(labels) if j == 'P$_%s$'%let]])
-    
-            samp.append(np.array(P_to_a(P,m_s)))
-            samp_labels.append(r'a$_%s$ [au]'%let)
-    
-    
-            if mod_labels['mean']:
-                samp_best_fit_par.append(P_to_a(np.mean(P),np.mean(m_s)))
-            elif mod_labels['median']:
-                samp_best_fit_par.append(P_to_a(np.median(P),np.median(m_s)))
-            elif mod_labels['best_gui']:
-                samp_best_fit_par.append(obj.semimajor[i])  
-            else:
-                samp_best_fit_par.append(P_to_a(P[np.argmax(ln)],obj.stellar_mass))
+        K = np.transpose(K)
+        P = np.transpose(P)
+        ecc = np.transpose(ecc)
+        incl = np.transpose(incl)
+
+        for k in range(len(m_s)):
+
+            m_a = get_mass_a_samples(np.array(K[k]),np.array(P[k]), np.array(ecc[k]), np.array(incl[k]), m_s[k], mass_type="J")
+            masses.append(m_a[0])
+            semimajor.append(m_a[1])
+
+        masses = np.transpose(masses)     
+        semimajor = np.transpose(semimajor)     
+ 
+ 
+        if mod_labels['mass']:
+            for i in range(obj.npl):
+                samp.append(np.array(masses[i] * M_fact))
+
+                if mod_labels['mean']:
+                    samp_best_fit_par.append( np.mean(masses[i]) * M_fact)
+                elif mod_labels['median']:
+                    samp_best_fit_par.append( np.median(masses[i]) * M_fact)
+                elif mod_labels['best_gui']:
+                    samp_best_fit_par.append(obj.masses[i]*M_fact)                
+                else:
+                    samp_best_fit_par.append(masses[i][np.argmax(ln)]*M_fact)
+
+
+        if mod_labels['semimajor']:
+
+            for i in range(obj.npl):
+                samp.append(np.array(semimajor[i]))
+                let = letters[i]
+                samp_labels.append(r'a$_%s$ [au]'%let)
+
+                if mod_labels['mean']:
+                    samp_best_fit_par.append(np.mean(semimajor[i]))
+                elif mod_labels['median']:
+                    samp_best_fit_par.append(np.median(semimajor[i]))
+                elif mod_labels['best_gui']:
+                    samp_best_fit_par.append(obj.semimajor[i])                
+                else:
+                    samp_best_fit_par.append(semimajor[i][np.argmax(ln)])
+
+
+
                 
                 
     if mod_labels['radius']:
@@ -1095,7 +1218,12 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
  
     verbose = True
     level = (100.0-68.3)/2.0
-    
+    quantiles = None
+    if cornerplot_opt["quantiles"] != None:
+        level_q = (100.0-cornerplot_opt["quantiles"])/2.0
+        quantiles = [level_q/100.0, 1.0-level_q/100.0]
+
+
     if verbose:
         print("   ")
         print("   ")
@@ -1177,9 +1305,7 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
         samples_stab = np.transpose(samples_stab)
         samples_ = np.transpose(samples_) 
 
-
-
-
+        
 
         if N_samp > len(samp_best_fit_par):
         
@@ -1190,7 +1316,7 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
                             reverse=cornerplot_opt["reverse"], 
                             upper=cornerplot_opt["upper"],
                             labels=samp_labels, 
-                            quantiles=[level/100.0, 1.0-level/100.0],
+                            quantiles=quantiles,
                             levels=(0.6827, 0.9545,0.9973), 
                             smooth=cornerplot_opt["smooth"],
                             smooth1d=cornerplot_opt["smooth1d"],
@@ -1220,7 +1346,7 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
                                 reverse=cornerplot_opt["reverse"], 
                                 upper=cornerplot_opt["upper"],
                                 labels=samp_labels, 
-                                quantiles=[level/100.0, 1.0-level/100.0],
+                                quantiles=quantiles,
                                 levels=(0.6827, 0.9545,0.9973), 
                                 smooth=cornerplot_opt["smooth"],
                                 smooth1d=cornerplot_opt["smooth1d"],
@@ -1246,7 +1372,7 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
                         reverse=cornerplot_opt["reverse"], 
                         upper=cornerplot_opt["upper"],
                         labels=samp_labels, 
-                        quantiles=[level/100.0, 1.0-level/100.0],
+                        quantiles=quantiles,
                         levels=(0.6827, 0.9545,0.9973), 
                         smooth=cornerplot_opt["smooth"],
                         smooth1d=cornerplot_opt["smooth1d"],
@@ -1277,7 +1403,7 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
                             reverse=cornerplot_opt["reverse"], 
                             upper=cornerplot_opt["upper"],
                             labels=samp_labels, 
-                            quantiles=[level/100.0, 1.0-level/100.0],
+                            quantiles=quantiles,
                             levels=(0.6827, 0.9545,0.9973), 
                             smooth=cornerplot_opt["smooth"],
                             smooth1d=cornerplot_opt["smooth1d"],
@@ -1295,6 +1421,8 @@ def cornerplot(obj, level=(100.0-68.3)/2.0, type_plot = 'mcmc', **kwargs):
                             plot_datapoints=cornerplot_opt["plot_datapoints"], 
                             kwargs=kwargs)
 
+    #axes = fig.axes()
+  #  axes.ticklabel_format(style='plain') 
 
     if type_plot == 'mcmc':
         fig.savefig(obj.mcmc_corner_plot_file)
@@ -1375,7 +1503,7 @@ def get_xyz(obj):
 
     for i in range(obj.npl):
 
-        pl_mass_in_st = float(obj.fit_results.mass[i])/ 1047.70266835
+        pl_mass_in_st = float(obj.fit_results.mass[i])/ 1047.348644
 
         pl_mass = pl_mass_in_st * (4*np.pi*np.pi)/(365.25*365.25)
         q = (1.0 - obj.params.planet_params[2 + i*7])*float(obj.fit_results.a[i])
@@ -1402,7 +1530,7 @@ def get_xyz(obj):
 
 def get_Hill_satb(obj):
 
-    st_mass = float(obj.params.stellar_mass)* 1047.70266835
+    st_mass = float(obj.params.stellar_mass)* 1047.348644
 
     if obj.fit_results.mass == 0 or len(np.atleast_1d(obj.fit_results.mass)) <=1:
         return False
@@ -1421,7 +1549,7 @@ def get_Hill_satb(obj):
 
 def get_AMD_stab(obj):
 
-    st_mass = float(obj.params.stellar_mass)* 1047.70266835
+    st_mass = float(obj.params.stellar_mass)* 1047.348644
 
     AMD_stable = True
 
@@ -1661,7 +1789,7 @@ def export_RV_data(obj, idset_ts, file="RV_data.txt",  jitter=False, o_c=False,
     print('Done!')
     return
 
-def export_RV_model(obj, file="RV_model.txt", width = 10, precision = 4):
+def export_RV_model(obj, file="RV_model.txt", width = 10, precision = 4,print_data=False):
 
     if len(obj.fit_results.rv_model.jd)==0:
         return
@@ -1683,6 +1811,11 @@ def export_RV_model(obj, file="RV_model.txt", width = 10, precision = 4):
     for i in range(len(JD)):
         f.write('{0:{width}.{precision}f}  {1:{width}.{precision}f} \n'.format(float(JD[i]), float(y_model[i]), width = width, precision = precision) )
     f.close()
+
+    if print_data:
+        print('{0:{width}.{precision}f}  {1:{width}.{precision}f} \n'.format(float(JD[i]), float(y_model[i]), width = width, precision = precision) )
+
+    
     print('Done!')
     return
 
@@ -3101,7 +3234,7 @@ def latex_pl_param_table(obj, width = 10, precision = 2, asymmetric = False, fil
         return text
     else:
 
-        table_file = open(file_name, 'w')
+        table_file = open("%s/%s"%(path,file_name), 'w')
         table_file.write(text)
         table_file.close()
         print("Done")
@@ -3481,7 +3614,8 @@ def latex_prior_table(obj, width = 10, precision = 2,  file_name='prior_table.te
         return text
     else:
 
-        table_file = open(file_name, 'w')
+        table_file = open("%s/%s"%(path,file_name), 'w')
+       # table_file = open(file_name, 'w')
         table_file.write(text)
         table_file.close()
         print("Done")
@@ -3670,7 +3804,7 @@ def mass_a_from_Kepler_fit(a,npl,m0):
     for i in range(npl):
 
         ap[i] = ap[i]/AU # to be in AU
-        pl_mass[i] = mass[i+1]*1047.70266835 # to be in Jup. masses
+        pl_mass[i] = mass[i+1]*1047.348644 # to be in Jup. masses
         # I have seen that 1 Sol Mass = 1047.92612 Jup. masses???
     return pl_mass,ap
 
@@ -3731,7 +3865,7 @@ pl.in
 
 
     for j in range(obj.npl):
-        getin_file.write(b'%s \n'%bytes(str(obj.fit_results.mass[j]/1047.70266835).encode()))
+        getin_file.write(b'%s \n'%bytes(str(obj.fit_results.mass[j]/1047.348644).encode()))
         getin_file.write(b'%s %s %s %s %s %s \n'%(bytes(str(obj.fit_results.a[j]).encode()),
                                                  bytes(str(obj.params.planet_params[7*j + 2]).encode()),
                                                  bytes(str(obj.params.planet_params[7*j + 5]).encode()),
@@ -3860,7 +3994,7 @@ pl.in
 
     for j in range(9):
         if obj.pl_arb_use[j] == True:
-            getin_file.write(b'%s \n'%bytes(str(obj.mass_arb[j]/1047.70266835).encode()))
+            getin_file.write(b'%s \n'%bytes(str(obj.mass_arb[j]/1047.348644).encode()))
             getin_file.write(b'%s %s %s %s %s %s \n'%(bytes(str(obj.a_arb[j]).encode()),
                                                  bytes(str(obj.e_arb[j]).encode()),
                                                  bytes(str(obj.i_arb[j]).encode()),

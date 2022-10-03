@@ -1,17 +1,17 @@
-exostriker/lib/fr/*
-exostriker/stability/mvs/*
-exostriker/stability/mvs_gr/*
-exostriker/stability/symba/*
-exostriker/datafiles/*
-exostriker/autosave/auto_save.ses
-exostriker/mcmc_samples
-exostriker/exported_plots
+qsostriker/lib/fr/*
+qsostriker/stability/mvs/*
+qsostriker/stability/mvs_gr/*
+qsostriker/stability/symba/*
+qsostriker/datafiles/*
+qsostriker/autosave/auto_save.ses
+qsostriker/mcmc_samples
+qsostriker/exported_plots
 
-exostriker/mcmc/MCMC_cornerplot.pdf
-exostriker/mcmc/eta_ceti_py3_mcmc.ses
+qsostriker/mcmc/MCMC_cornerplot.pdf
+qsostriker/mcmc/eta_ceti_py3_mcmc.ses
 
 *.pyc
-exostriker/lib/libswift.a
+qsostriker/lib/libswift.a
 source/swift_j/libswift.a
 @make
 
